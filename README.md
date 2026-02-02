@@ -70,7 +70,7 @@ This comprehensive automated setup script transforms a fresh Kali Linux installa
 - ✅ Go 1.21+ (latest)
 - ✅ Rust toolchain (via rustup)
 - ✅ Python 3.11+ with pipx
-- ✅ Docker & Docker Compose
+- ✅ Docker CE with compose plugin
 - ✅ OpenJDK 21 LTS
 - ✅ Node.js 20.x LTS
 - ✅ build-essential & make
@@ -96,13 +96,13 @@ This comprehensive automated setup script transforms a fresh Kali Linux installa
 | 🌐 **Web** | 10 tools | Web application security testing |
 | 🔍 **Recon** | 7 tools | Reconnaissance and enumeration |
 | 🕸️ **Network** | 4 tools | Network analysis and pivoting |
-| 🔓 **Exploit** | 2 tools | Exploitation frameworks and C2 |
+| 🔓 **Exploit** | 3 tools | Exploitation frameworks and C2 |
 | 🩸 **AD** | 5 tools | Active Directory assessment |
 | 🔐 **PrivEsc** | 2 tools | Privilege escalation |
 | 🤖 **Automation** | 1 tool | Automated reconnaissance |
 | 🔍 **OSINT** | 3 tools | Information gathering |
-| ☁️ **Cloud** | 2 tools | Cloud security testing |
-| 🔧 **Misc** | 2 tools | Various utilities |
+| ☁️ **Cloud** | 5 tools | Cloud security testing |
+| 🔧 **Misc** | 4 tools | Various utilities |
 
 ### 🎨 Script Features
 
@@ -169,10 +169,10 @@ sudo ./kali-setup.sh /path/to/your/certificate.crt
 ### Installation Time
 
 ```
-⏱️ Estimated time: 60-90 minutes
-📊 Total steps: 85
-🔧 Tools installed: 41
-📚 Wordlist repos: 3
+⏱️ Estimated time: 70-100 minutes
+📊 Total steps: 97
+🔧 Tools installed: 47
+📚 Wordlist repos: 4
 🛠️ Build dependencies: Node.js, build-essential, make
 ```
 
@@ -230,7 +230,7 @@ sudo ./kali-setup.sh /path/to/your/certificate.crt
 
 </details>
 
-### 🔓 Exploitation & C2 (2 tools)
+### 🔓 Exploitation & C2 (3 tools)
 
 <details>
 <summary>Click to expand</summary>
@@ -239,6 +239,7 @@ sudo ./kali-setup.sh /path/to/your/certificate.crt
 |------|------|-------------|
 | **sliver** | Go | Modern C2 framework |
 | **impacket** | Python | SMB/MSRPC toolkit |
+| **metasploit-framework** | Ruby | Comprehensive exploitation framework |
 
 </details>
 
@@ -293,7 +294,7 @@ sudo ./kali-setup.sh /path/to/your/certificate.crt
 
 </details>
 
-### ☁️ Cloud & Container Security (2 tools)
+### ☁️ Cloud & Container Security (5 tools)
 
 <details>
 <summary>Click to expand</summary>
@@ -302,10 +303,13 @@ sudo ./kali-setup.sh /path/to/your/certificate.crt
 |------|------|-------------|
 | **trivy** | Go | Container vulnerability scanner |
 | **kube-hunter** | Python | Kubernetes pentesting |
+| **cloudfox** | Go | AWS/Azure/GCP enumeration |
+| **scoutsuite** | Python | Multi-cloud security auditing |
+| **prowler** | Python | AWS security assessment |
 
 </details>
 
-### 🔧 Miscellaneous (2 tools)
+### 🔧 Miscellaneous (4 tools)
 
 <details>
 <summary>Click to expand</summary>
@@ -314,14 +318,17 @@ sudo ./kali-setup.sh /path/to/your/certificate.crt
 |------|------|-------------|
 | **Ciphey** | Python | Automated decryption |
 | **haiti** | Ruby | Hash identifier |
+| **gitleaks** | Go | Git secret scanner |
+| **trufflehog** | Python | Credential scanner |
 
 </details>
 
-### 📚 Wordlist Repositories (3 repos)
+### 📚 Wordlist Repositories (4 repos)
 
 - **fuzzdb** - Comprehensive fuzzing patterns
-- **SecLists** - Industry-standard wordlists
+- **SecLists** - Industry-standard wordlists (cloned from GitHub with depth 1)
 - **PayloadsAllTheThings** - Practical payload collection
+- **Default-Accounts-Arsenal** - Default credentials database
 
 ---
 
@@ -353,7 +360,8 @@ sudo ./kali-setup.sh /path/to/your/certificate.crt
 ├── wordlists/                    # Wordlist repositories
 │   ├── fuzzdb/
 │   ├── SecLists/
-│   └── PayloadsAllTheThings/
+│   ├── PayloadsAllTheThings/
+│   └── Default-Accounts-Arsenal/
 │
 ├── pentests/                     # Project organization
 │   ├── 2026.01/

@@ -29,7 +29,7 @@ SCRIPT_START_TIME=$(date +%s)
 LOG_FILE="$HOME/kali-setup.log"
 ERROR_COUNT=0
 CURRENT_STEP=0
-TOTAL_STEPS=85  # Updated to match actual progress() calls
+TOTAL_STEPS=97  # Updated to match actual progress() calls (added 2 wordlist + 6 new tools + 4 Docker steps)
 CERT_FILE=""
 
 ################################################################################
@@ -222,9 +222,32 @@ install_dev_tools() {
     apt install -y pipx || log_error "Failed to install pipx"
     su - "$ACTUAL_USER" -c "pipx ensurepath" || log_warning "pipx ensurepath failed"
     
-    # Docker
-    progress "Installing Docker"
-    apt install -y docker.io docker-compose || log_error "Failed to install Docker"
+    # Docker - Official Docker CE Installation
+    progress "Removing old Docker packages"
+    apt remove -y docker.io docker-compose docker-doc podman-docker containerd runc 2>/dev/null || log_info "Old Docker packages not installed or already removed"
+    
+    progress "Installing Docker prerequisites"
+    apt install -y ca-certificates curl || log_error "Failed to install Docker prerequisites"
+    
+    progress "Setting up Docker GPG key"
+    install -m 0755 -d /etc/apt/keyrings || log_error "Failed to create keyrings directory"
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc || log_error "Failed to download Docker GPG key"
+    chmod a+r /etc/apt/keyrings/docker.asc || log_error "Failed to set permissions on Docker GPG key"
+    
+    progress "Adding Docker repository for Debian 13 Trixie"
+    tee /etc/apt/sources.list.d/docker.sources > /dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: trixie
+Components: stable
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+    
+    progress "Updating package lists for Docker repository"
+    apt update || log_error "Failed to update package lists after adding Docker repository"
+    
+    progress "Installing Docker CE and plugins"
+    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || log_error "Failed to install Docker CE"
     
     progress "Adding user to docker group"
     usermod -aG docker "$ACTUAL_USER" || log_error "Failed to add user to docker group"
@@ -374,7 +397,7 @@ end
 # Wordlist update function
 function update-wordlists
     echo "Updating wordlists..."
-    set wordlist_dirs ~/wordlists/fuzzdb ~/wordlists/SecLists ~/wordlists/PayloadsAllTheThings
+    set wordlist_dirs ~/wordlists/fuzzdb ~/wordlists/SecLists ~/wordlists/PayloadsAllTheThings ~/wordlists/Default-Accounts-Arsenal
     for dir in $wordlist_dirs
         if test -d $dir
             echo "Updating $dir"
@@ -404,6 +427,8 @@ function update-tools
     go install github.com/jpillora/chisel@latest
     go install github.com/nicocha30/ligolo-ng/cmd/proxy@latest
     go install github.com/nicocha30/ligolo-ng/cmd/agent@latest
+    go install github.com/BishopFox/cloudfox@latest
+    go install github.com/gitleaks/gitleaks/v8@latest
 
     # Update Rust tools
     echo "Updating Rust tools..."
@@ -481,6 +506,9 @@ create_directory_structure() {
 clone_wordlists() {
     section_header "Cloning Wordlist Repositories"
 
+    progress "Removing seclists package (if installed)"
+    apt remove -y seclists 2>/dev/null || log_info "seclists package not installed or already removed"
+
     progress "Cloning fuzzdb"
     su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/fuzzdb-project/fuzzdb.git ~/wordlists/fuzzdb" || log_error "Failed to clone fuzzdb"
 
@@ -489,6 +517,9 @@ clone_wordlists() {
 
     progress "Cloning PayloadsAllTheThings"
     su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/swisskyrepo/PayloadsAllTheThings.git ~/wordlists/PayloadsAllTheThings" || log_error "Failed to clone PayloadsAllTheThings"
+
+    progress "Cloning Default-Accounts-Arsenal"
+    su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/PekSec/Default-Accounts-Arsenal.git ~/wordlists/Default-Accounts-Arsenal" || log_error "Failed to clone Default-Accounts-Arsenal"
     
     log_success "Wordlist repositories cloned"
 }
@@ -605,6 +636,9 @@ install_exploit_tools() {
     progress "Installing impacket"
     su - "$ACTUAL_USER" -c "pipx install impacket" || log_error "Failed to install impacket"
 
+    progress "Installing Metasploit Framework"
+    apt install -y metasploit-framework || log_error "Failed to install Metasploit Framework"
+
     log_success "Exploitation tools installed"
 }
 
@@ -698,6 +732,15 @@ install_cloud_tools() {
     progress "Installing kube-hunter"
     su - "$ACTUAL_USER" -c "pipx install kube-hunter" || log_error "Failed to install kube-hunter"
 
+    progress "Installing CloudFox"
+    su - "$ACTUAL_USER" -c "go install github.com/BishopFox/cloudfox@latest" || log_error "Failed to install CloudFox"
+
+    progress "Installing ScoutSuite"
+    su - "$ACTUAL_USER" -c "pipx install scoutsuite" || log_error "Failed to install ScoutSuite"
+
+    progress "Installing Prowler"
+    su - "$ACTUAL_USER" -c "pipx install prowler" || log_error "Failed to install Prowler"
+
     log_success "Cloud tools installed"
 }
 
@@ -712,6 +755,12 @@ install_misc_tools() {
     
     progress "Installing haiti"
     su - "$ACTUAL_USER" -c "pipx install haiti-hash" || log_error "Failed to install haiti"
+
+    progress "Installing GitLeaks"
+    su - "$ACTUAL_USER" -c "go install github.com/gitleaks/gitleaks/v8@latest" || log_error "Failed to install GitLeaks"
+
+    progress "Installing TruffleHog"
+    su - "$ACTUAL_USER" -c "pipx install trufflehog" || log_error "Failed to install TruffleHog"
     
     log_success "Miscellaneous tools installed"
 }
@@ -934,13 +983,13 @@ display_summary() {
     echo -e "${YELLOW}Errors encountered: $ERROR_COUNT${NC}"
     echo ""
     echo -e "${CYAN}Statistics:${NC}"
-    echo "  - Total tools installed: 41"
-    echo "  - Wordlist repositories: 3"
+    echo "  - Total tools installed: 47"
+    echo "  - Wordlist repositories: 4"
     echo "  - Directory categories: 10"
-    echo "  - Go tools: 14"
+    echo "  - Go tools: 16 (+ cloudfox, gitleaks)"
     echo "  - Rust tools: 5 (feroxbuster, rustscan, rustcat, rusthound, eza)"
-    echo "  - Pipx tools: 11 (impacket, certipy-ad, coercer, autorecon, sherlock, holehe, h8mail, ciphey, haiti, kube-hunter, arjun)"
-    echo "  - APT tools: 3 (sqlmap, neo4j, trivy)"
+    echo "  - Pipx tools: 14 (+ scoutsuite, prowler, trufflehog)"
+    echo "  - APT tools: 4 (sqlmap, neo4j, trivy, metasploit-framework)"
     echo "  - Git clone tools: 5 (XSStrike, Corsy, BloodHound, PEASS-ng, linux-exploit-suggester)"
     echo "  - Build dependencies: Node.js, build-essential, make"
     echo ""
