@@ -490,7 +490,7 @@ create_directory_structure() {
     su - "$ACTUAL_USER" -c "mkdir -p ~/wordlists ~/pentests ~/tools/{web,recon,network,exploit,ad,privesc,automation,osint,cloud,misc}"
     
     progress "Creating monthly pentest directories"
-    su - "$ACTUAL_USER" -c "mkdir -p ~/pentests/2026.{01..12}"
+    su - "$ACTUAL_USER" -c 'for m in $(seq -f "%02g" 1 12); do mkdir -p ~/pentests/2026.$m; done'
     
     progress "Setting proper permissions"
     find "$ACTUAL_HOME/tools" -type d -exec chmod 755 {} \; 2>/dev/null || true
