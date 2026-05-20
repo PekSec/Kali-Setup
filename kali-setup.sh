@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 
 ################################################################################
-# Kali Linux Complete Setup Script
+# Kali Linux Complete Setup Script - soft-fail / self-healing refactor
 # Author: Barış PEKALP
-# Description: Automated setup for pentesting environment
-# Usage: sudo ./kali-setup.sh [path/to/cert.crt]
+# Description: Automated setup for a pentesting environment
+# Usage: sudo ./kali-setup-refactored-soft-heal.sh [path/to/cert.crt]
+#
+# Design goals:
+# - Keep the original workflow order.
+# - Do not fail-fast for individual tool/package failures.
+# - Retry transient failures and attempt local self-healing.
+# - Skip already-installed tools where safe.
+# - Keep a structured error/warning summary at the end.
 ################################################################################
 
-# Removed set -e to allow proper error handling with || log_error patterns
-# Error tracking is handled through ERROR_COUNT variable and trap handler
+# No `set -e`: every operational failure is handled as a soft error.
+# `pipefail` is kept so piped installers fail when any segment fails.
+set -o pipefail
+umask 022
 
 ################################################################################
 # COLOR CODES
@@ -19,24 +28,44 @@ readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly MAGENTA='\033[0;35m'
 readonly CYAN='\033[0;36m'
-readonly NC='\033[0m' # No Color
+readonly NC='\033[0m'
 readonly BOLD='\033[1m'
 
 ################################################################################
 # GLOBAL VARIABLES
 ################################################################################
 SCRIPT_START_TIME=$(date +%s)
-LOG_FILE="$HOME/kali-setup.log"
+LOG_FILE="${LOG_FILE:-/tmp/kali-setup.log}"
 ERROR_COUNT=0
+WARNING_COUNT=0
+SELF_HEAL_COUNT=0
+SKIPPED_COUNT=0
 CURRENT_STEP=0
-TOTAL_STEPS=97  # Updated to match actual progress() calls (added 2 wordlist + 6 new tools + 4 Docker steps)
 CERT_FILE=""
+ACTUAL_USER=""
+ACTUAL_HOME=""
+SOFT_ABORT=0
+APT_UPDATED=0
+FORCE_REINSTALL="${FORCE_REINSTALL:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+PENTEST_YEAR="${PENTEST_YEAR:-$(date +%Y)}"
+DOCKER_DEBIAN_SUITE="${DOCKER_DEBIAN_SUITE:-trixie}"
+APT_INSTALL_RECOMMENDS="${APT_INSTALL_RECOMMENDS:-1}"
+
+# Keep failures inspectable without terminating the run.
+declare -a FAILED_ACTIONS=()
+declare -a WARNING_ACTIONS=()
 
 ################################################################################
-# LOGGING FUNCTIONS
+# LOGGING AND OUTPUT
 ################################################################################
+q() {
+    printf '%q' "$1"
+}
+
 log() {
     local message="$1"
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
     echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $message" | tee -a "$LOG_FILE"
 }
 
@@ -50,16 +79,12 @@ log_success() {
 
 log_warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1" | tee -a "$LOG_FILE"
+    ((WARNING_COUNT++))
 }
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1" | tee -a "$LOG_FILE"
     ((ERROR_COUNT++))
-}
-
-progress() {
-    ((CURRENT_STEP++))
-    echo -e "${CYAN}[${CURRENT_STEP}/${TOTAL_STEPS}]${NC} $1"
 }
 
 section_header() {
@@ -70,59 +95,76 @@ section_header() {
     echo ""
 }
 
-################################################################################
-# ERROR HANDLING
-################################################################################
-handle_error() {
-    local exit_code=$?
-    local line_number=$1
-    log_error "Command failed with exit code $exit_code at line $line_number"
-    return 0  # Continue execution
+progress() {
+    ((CURRENT_STEP++))
+    echo -e "${CYAN}[${CURRENT_STEP}]${NC} $1"
 }
 
-trap 'handle_error ${LINENO}' ERR
+record_issue() {
+    local severity="$1"
+    local description="$2"
+    local rc="$3"
+    local command_text="$4"
 
-################################################################################
-# COMMAND VERIFICATION
-################################################################################
-check_command() {
-    local cmd="$1"
-    local install_msg="$2"
-
-    if ! command -v "$cmd" &>/dev/null; then
-        log_error "$cmd not found. $install_msg"
-        return 1
-    fi
-    return 0
-}
-
-################################################################################
-# PRIVILEGE CHECK
-################################################################################
-check_privileges() {
-    section_header "Checking Privileges"
-    
-    if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root or with sudo"
-        exit 1
-    fi
-    
-    # Get the actual user (not root)
-    if [[ -n "$SUDO_USER" ]]; then
-        ACTUAL_USER="$SUDO_USER"
-        ACTUAL_HOME=$(eval echo ~$SUDO_USER)
+    if [[ "$severity" == "warning" ]]; then
+        log_warning "$description failed with rc=$rc"
+        WARNING_ACTIONS+=("$description | rc=$rc | $command_text")
     else
-        ACTUAL_USER=$(whoami)
+        log_error "$description failed with rc=$rc"
+        FAILED_ACTIONS+=("$description | rc=$rc | $command_text")
+    fi
+}
+
+################################################################################
+# USER / PRIVILEGE HANDLING
+################################################################################
+detect_user_context() {
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]]; then
+        ACTUAL_USER="$SUDO_USER"
+    else
+        ACTUAL_USER="$(id -un 2>/dev/null || whoami)"
+    fi
+
+    ACTUAL_HOME="$(getent passwd "$ACTUAL_USER" 2>/dev/null | awk -F: '{print $6}')"
+    if [[ -z "$ACTUAL_HOME" || ! -d "$ACTUAL_HOME" ]]; then
+        ACTUAL_HOME="$(eval echo "~$ACTUAL_USER" 2>/dev/null)"
+    fi
+    if [[ -z "$ACTUAL_HOME" || ! -d "$ACTUAL_HOME" ]]; then
         ACTUAL_HOME="$HOME"
     fi
-    
-    log_success "Running as root with actual user: $ACTUAL_USER"
-    log_info "User home directory: $ACTUAL_HOME"
+
+    LOG_FILE="${LOG_FILE:-$ACTUAL_HOME/kali-setup.log}"
+    # If LOG_FILE was defaulted to /tmp before context detection, move it to user home.
+    if [[ "$LOG_FILE" == "/tmp/kali-setup.log" && -n "$ACTUAL_HOME" ]]; then
+        LOG_FILE="$ACTUAL_HOME/kali-setup.log"
+    fi
+
+    touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/kali-setup.log"
+    if [[ $EUID -eq 0 ]]; then
+        chown "$ACTUAL_USER:$ACTUAL_USER" "$LOG_FILE" 2>/dev/null || true
+    fi
 }
 
-################################################################################
-# ARGUMENT PARSING
-################################################################################
+check_privileges() {
+    section_header "Checking Privileges"
+    detect_user_context
+
+    if [[ $EUID -ne 0 ]]; then
+        if command -v sudo >/dev/null 2>&1; then
+            log_warning "Script is not running as root; attempting self-heal by re-executing via sudo"
+            exec sudo -E bash "$0" "$@"
+        fi
+
+        record_issue "error" "Root privileges unavailable and sudo not found" 1 "sudo -E bash $0"
+        SOFT_ABORT=1
+        return 0
+    fi
+
+    log_success "Running as root with actual user: $ACTUAL_USER"
+    log_info "User home directory: $ACTUAL_HOME"
+    log_info "Log file: $LOG_FILE"
+}
+
 parse_arguments() {
     if [[ $# -gt 0 ]]; then
         CERT_FILE="$1"
@@ -131,64 +173,402 @@ parse_arguments() {
 }
 
 ################################################################################
+# COMMAND EXECUTION / SELF-HEALING
+################################################################################
+wait_for_apt_locks() {
+    local locks=(
+        /var/lib/dpkg/lock
+        /var/lib/dpkg/lock-frontend
+        /var/lib/apt/lists/lock
+        /var/cache/apt/archives/lock
+    )
+    local waited=0
+    local max_wait=180
+
+    while true; do
+        local busy=0
+        local lock
+        for lock in "${locks[@]}"; do
+            if [[ -e "$lock" ]] && fuser "$lock" >/dev/null 2>&1; then
+                busy=1
+                break
+            fi
+        done
+
+        if [[ $busy -eq 0 ]]; then
+            return 0
+        fi
+
+        if (( waited >= max_wait )); then
+            return 1
+        fi
+
+        log_warning "APT/dpkg lock is busy; waiting 5 seconds"
+        sleep 5
+        waited=$((waited + 5))
+    done
+}
+
+apt_repair() {
+    log_warning "Attempting APT/dpkg self-heal"
+    ((SELF_HEAL_COUNT++))
+
+    wait_for_apt_locks || log_warning "APT lock wait timed out; continuing with repair attempt"
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a >>"$LOG_FILE" 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get -f install -y >>"$LOG_FILE" 2>&1 || true
+    apt-get clean >>"$LOG_FILE" 2>&1 || true
+}
+
+self_heal() {
+    local command_text="$1"
+    local rc="$2"
+
+    case "$command_text" in
+        *apt-get*|*apt\ *|*dpkg*)
+            apt_repair
+            ;;
+        *go\ install*)
+            log_warning "Attempting Go environment self-heal after rc=$rc"
+            ((SELF_HEAL_COUNT++))
+            DEBIAN_FRONTEND=noninteractive apt-get install -y golang-go >>"$LOG_FILE" 2>&1 || true
+            ;;
+        *cargo\ install*|*rustup.rs*)
+            log_warning "Attempting Rust/Cargo environment self-heal after rc=$rc"
+            ((SELF_HEAL_COUNT++))
+            if [[ -n "$ACTUAL_USER" ]]; then
+                runuser -u "$ACTUAL_USER" -- env HOME="$ACTUAL_HOME" bash -lc 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y' >>"$LOG_FILE" 2>&1 || true
+            fi
+            ;;
+        *pipx*)
+            log_warning "Attempting pipx environment self-heal after rc=$rc"
+            ((SELF_HEAL_COUNT++))
+            DEBIAN_FRONTEND=noninteractive apt-get install -y pipx python3-venv python3-pip >>"$LOG_FILE" 2>&1 || true
+            if [[ -n "$ACTUAL_USER" ]]; then
+                runuser -u "$ACTUAL_USER" -- env HOME="$ACTUAL_HOME" bash -lc 'python3 -m pipx ensurepath || pipx ensurepath' >>"$LOG_FILE" 2>&1 || true
+            fi
+            ;;
+        *systemctl*)
+            log_warning "Attempting systemd daemon-reload after rc=$rc"
+            ((SELF_HEAL_COUNT++))
+            systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
+            ;;
+        *git\ clone*|*git\ -C*)
+            log_warning "Git operation failed; retry may recover transient network/repository state"
+            ((SELF_HEAL_COUNT++))
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+exec_cmd() {
+    local description="$1"
+    local attempts="$2"
+    local command_text="$3"
+    local attempt=1
+    local rc=0
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log_info "DRY_RUN: $description :: $command_text"
+        return 0
+    fi
+
+    while (( attempt <= attempts )); do
+        log_info "Running: $description (attempt $attempt/$attempts)"
+        log "CMD: $command_text"
+
+        if [[ "$command_text" == *apt-get* || "$command_text" == *dpkg* ]]; then
+            wait_for_apt_locks || log_warning "APT lock wait timed out before: $description"
+        fi
+
+        bash -o pipefail -c "$command_text" >>"$LOG_FILE" 2>&1
+        rc=$?
+
+        if [[ $rc -eq 0 ]]; then
+            log_success "$description"
+            return 0
+        fi
+
+        log_warning "$description failed on attempt $attempt/$attempts with rc=$rc"
+        self_heal "$command_text" "$rc" || true
+
+        if (( attempt < attempts )); then
+            sleep $((attempt * 2))
+        fi
+        ((attempt++))
+    done
+
+    return "$rc"
+}
+
+run_cmd() {
+    local description="$1"
+    local severity="$2"
+    local attempts="$3"
+    local command_text="$4"
+
+    progress "$description"
+    if exec_cmd "$description" "$attempts" "$command_text"; then
+        return 0
+    fi
+
+    local rc=$?
+    record_issue "$severity" "$description" "$rc" "$command_text"
+    return 0
+}
+
+run_as_user_cmd() {
+    local description="$1"
+    local severity="$2"
+    local attempts="$3"
+    local user_command="$4"
+    local user_q home_q command_q
+
+    user_q="$(q "$ACTUAL_USER")"
+    home_q="$(q "$ACTUAL_HOME")"
+    command_q="$(q "export HOME=$ACTUAL_HOME; export GOPATH=\"\$HOME/go\"; export PATH=\"\$HOME/.local/bin:\$HOME/go/bin:\$HOME/.cargo/bin:/usr/local/go/bin:\$PATH\"; [[ -f \"\$HOME/.cargo/env\" ]] && source \"\$HOME/.cargo/env\"; $user_command")"
+
+    run_cmd "$description" "$severity" "$attempts" "runuser -u $user_q -- env HOME=$home_q bash -lc $command_q"
+}
+
+user_cmd_exists() {
+    local binary="$1"
+    runuser -u "$ACTUAL_USER" -- env HOME="$ACTUAL_HOME" bash -lc "export PATH=\"\$HOME/.local/bin:\$HOME/go/bin:\$HOME/.cargo/bin:/usr/local/go/bin:\$PATH\"; command -v $(q "$binary")" >>"$LOG_FILE" 2>&1
+}
+
+root_cmd_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+mark_skipped() {
+    local message="$1"
+    ((SKIPPED_COUNT++))
+    progress "$message"
+    log_success "$message - already satisfied, skipping"
+}
+
+################################################################################
+# APT HELPERS
+################################################################################
+apt_update_once() {
+    if [[ "$APT_UPDATED" == "1" ]]; then
+        log_info "APT package lists already updated in this run; skipping duplicate update"
+        return 0
+    fi
+
+    progress "Updating package lists"
+    if exec_cmd "Updating package lists" 3 "DEBIAN_FRONTEND=noninteractive apt-get update"; then
+        APT_UPDATED=1
+        return 0
+    fi
+
+    local rc=$?
+    record_issue "error" "Updating package lists" "$rc" "apt-get update"
+    return 0
+}
+
+is_pkg_installed() {
+    local pkg="$1"
+    dpkg-query -W -f='${db:Status-Abbrev}' "$pkg" 2>/dev/null | grep -q '^ii'
+}
+
+apt_install_packages() {
+    local description="$1"
+    shift
+    local packages=("$@")
+    local missing=()
+    local pkg
+
+    for pkg in "${packages[@]}"; do
+        if ! is_pkg_installed "$pkg"; then
+            missing+=("$pkg")
+        fi
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        mark_skipped "$description"
+        return 0
+    fi
+
+    local opts="-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+    if [[ "$APT_INSTALL_RECOMMENDS" == "0" ]]; then
+        opts="$opts --no-install-recommends"
+    fi
+
+    local quoted_packages=""
+    for pkg in "${missing[@]}"; do
+        quoted_packages+=" $(q "$pkg")"
+    done
+
+    run_cmd "$description" "error" 3 "DEBIAN_FRONTEND=noninteractive apt-get install $opts $quoted_packages"
+}
+
+################################################################################
+# INSTALL HELPERS
+################################################################################
+clone_or_update_repo() {
+    local description="$1"
+    local repo="$2"
+    local target="$3"
+    local depth="${4:-1}"
+    local parent backup
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        progress "$description"
+        log_info "DRY_RUN: would clone/update $repo -> $target"
+        return 0
+    fi
+
+    parent="$(dirname "$target")"
+    mkdir -p "$parent" 2>/dev/null || true
+    chown -R "$ACTUAL_USER:$ACTUAL_USER" "$parent" 2>/dev/null || true
+
+    if [[ -d "$target/.git" ]]; then
+        chown -R "$ACTUAL_USER:$ACTUAL_USER" "$target" 2>/dev/null || true
+        run_as_user_cmd "$description - updating existing repository" "warning" 2 "git -C $(q "$target") pull --ff-only --depth $(q "$depth")"
+        return 0
+    fi
+
+    if [[ -e "$target" ]]; then
+        backup="${target}.backup.$(date +%Y%m%d%H%M%S)"
+        run_cmd "$description - backing up non-git target" "warning" 1 "mv $(q "$target") $(q "$backup")"
+        chown -R "$ACTUAL_USER:$ACTUAL_USER" "$backup" 2>/dev/null || true
+    fi
+
+    run_as_user_cmd "$description" "error" 2 "git clone --depth $(q "$depth") $(q "$repo") $(q "$target")"
+    chown -R "$ACTUAL_USER:$ACTUAL_USER" "$target" 2>/dev/null || true
+}
+install_go_tool() {
+    local description="$1"
+    local binary="$2"
+    local module="$3"
+
+    if [[ "$FORCE_REINSTALL" != "1" ]] && user_cmd_exists "$binary"; then
+        mark_skipped "$description"
+        return 0
+    fi
+
+    run_as_user_cmd "$description" "error" 2 "go install $(q "$module")"
+}
+
+install_cargo_tool() {
+    local description="$1"
+    local binary="$2"
+    local crate="$3"
+
+    if [[ "$FORCE_REINSTALL" != "1" ]] && user_cmd_exists "$binary"; then
+        mark_skipped "$description"
+        return 0
+    fi
+
+    run_as_user_cmd "$description" "error" 2 "cargo install $(q "$crate")"
+}
+
+install_pipx_tool() {
+    local description="$1"
+    local binary="$2"
+    local package_spec="$3"
+
+    if [[ "$FORCE_REINSTALL" != "1" ]] && user_cmd_exists "$binary"; then
+        mark_skipped "$description"
+        return 0
+    fi
+
+    run_as_user_cmd "$description" "error" 2 "python3 -m pipx install $(q "$package_spec") || pipx install $(q "$package_spec")"
+}
+
+install_pip_requirements_repo() {
+    local description="$1"
+    local repo="$2"
+    local target="$3"
+    local entry_file="${4:-}"
+
+    clone_or_update_repo "$description - repository" "$repo" "$target" 1
+
+    local install_cmd="cd $(q "$target") && python3 -m pip install --user -r requirements.txt"
+    run_as_user_cmd "$description - Python requirements" "warning" 2 "$install_cmd"
+
+    if [[ -n "$entry_file" ]]; then
+        run_as_user_cmd "$description - executable bit" "warning" 1 "chmod +x $(q "$target/$entry_file") 2>/dev/null || true"
+    fi
+}
+
+################################################################################
 # CERTIFICATE MANAGEMENT
 ################################################################################
 install_certificate() {
     section_header "Certificate Management"
-    
+
     if [[ -z "$CERT_FILE" ]]; then
         log_warning "No certificate file provided, skipping certificate installation"
         return 0
     fi
-    
+
     if [[ ! -f "$CERT_FILE" ]]; then
-        log_error "Certificate file not found: $CERT_FILE"
-        return 1
+        record_issue "warning" "Certificate file not found" 1 "$CERT_FILE"
+        return 0
     fi
-    
-    progress "Installing custom certificate"
-    
-    local cert_name=$(basename "$CERT_FILE")
-    cp "$CERT_FILE" "/usr/local/share/ca-certificates/$cert_name" || {
-        log_error "Failed to copy certificate"
-        return 1
-    }
-    
-    update-ca-certificates || {
-        log_error "Failed to update CA certificates"
-        return 1
-    }
-    
-    log_success "Certificate installed successfully"
+
+    local cert_name cert_target
+    cert_name="$(basename "$CERT_FILE")"
+    cert_target="/usr/local/share/ca-certificates/$cert_name"
+
+    run_cmd "Installing custom certificate" "warning" 2 "cp $(q "$CERT_FILE") $(q "$cert_target") && update-ca-certificates"
 }
 
 ################################################################################
 # SYSTEM UPDATE
 ################################################################################
+install_openjdk() {
+    progress "Installing OpenJDK"
+    if is_pkg_installed openjdk-21-jdk || is_pkg_installed openjdk-17-jdk; then
+        log_success "OpenJDK already installed"
+        ((SKIPPED_COUNT++))
+        return 0
+    fi
+
+    if exec_cmd "Installing OpenJDK 21" 2 "DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-21-jdk"; then
+        return 0
+    fi
+
+    log_warning "OpenJDK 21 installation failed; trying OpenJDK 17 fallback"
+    if exec_cmd "Installing OpenJDK 17 fallback" 2 "DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jdk"; then
+        return 0
+    fi
+
+    local rc=$?
+    record_issue "error" "Installing OpenJDK" "$rc" "apt-get install openjdk-21-jdk || openjdk-17-jdk"
+}
+
+install_nodesource() {
+    progress "Installing Node.js for BloodHound"
+    if root_cmd_exists node; then
+        log_success "Node.js already available"
+        ((SKIPPED_COUNT++))
+        return 0
+    fi
+
+    if exec_cmd "Adding NodeSource repository" 2 "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"; then
+        apt_install_packages "Installing Node.js" nodejs
+        return 0
+    fi
+
+    log_warning "NodeSource setup failed; trying distro nodejs package"
+    apt_install_packages "Installing distro Node.js fallback" nodejs npm
+}
+
 update_system() {
     section_header "System Update & Basic Packages"
-    
-    progress "Updating package lists"
-    apt update || log_error "Failed to update package lists"
-    
-    progress "Upgrading system packages"
-    apt upgrade -y || log_error "Failed to upgrade packages"
-    
-    progress "Installing basic tools"
-    apt install -y git wget curl vim || log_error "Failed to install basic tools"
-    
-    progress "Installing modern CLI tools"
-    apt install -y bat fd-find ripgrep tmux btop || log_error "Failed to install CLI tools"
-    
-    progress "Installing OpenJDK"
-    apt install -y openjdk-21-jdk || apt install -y openjdk-17-jdk || log_error "Failed to install OpenJDK"
 
-    progress "Installing build tools"
-    apt install -y build-essential make || log_error "Failed to install build tools"
+    apt_update_once
+    run_cmd "Upgrading system packages" "warning" 2 "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
 
-    progress "Installing Node.js for BloodHound"
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - || log_error "Failed to add Node.js repository"
-    apt install -y nodejs || log_error "Failed to install Node.js"
+    apt_install_packages "Installing basic tools" git wget curl vim ca-certificates gnupg lsb-release fzf jq unzip p7zip-full
+    apt_install_packages "Installing modern CLI tools" bat fd-find ripgrep tmux btop
+    install_openjdk
+    apt_install_packages "Installing build tools" build-essential make gcc g++ pkg-config libssl-dev
+    install_nodesource
 
     log_success "System update completed"
 }
@@ -198,94 +578,103 @@ update_system() {
 ################################################################################
 install_shell() {
     section_header "Shell Installation"
-    
-    progress "Installing fish shell"
-    apt install -y fish || log_error "Failed to install fish"
-    
-    progress "Installing Starship prompt"
-    curl -sS https://starship.rs/install.sh | sh -s -- -y || log_error "Failed to install Starship"
-    
+
+    apt_install_packages "Installing fish shell" fish
+
+    if root_cmd_exists starship; then
+        mark_skipped "Installing Starship prompt"
+    else
+        run_cmd "Installing Starship prompt" "warning" 2 "curl -fsSL https://starship.rs/install.sh | sh -s -- -y"
+    fi
+
     log_success "Shell tools installed"
 }
 
 ################################################################################
 # DEVELOPMENT TOOLS
 ################################################################################
-install_dev_tools() {
-    section_header "Development Tools Installation"
-    
-    # Python
-    progress "Installing Python development tools"
-    apt install -y python3-full python3-pip python3-venv || log_error "Failed to install Python tools"
-    
-    progress "Installing pipx"
-    apt install -y pipx || log_error "Failed to install pipx"
-    su - "$ACTUAL_USER" -c "pipx ensurepath" || log_warning "pipx ensurepath failed"
-    
-    # Docker - Official Docker CE Installation
-    progress "Removing old Docker packages"
-    apt remove -y docker.io docker-compose docker-doc podman-docker containerd runc 2>/dev/null || log_info "Old Docker packages not installed or already removed"
-    
-    progress "Installing Docker prerequisites"
-    apt install -y ca-certificates curl || log_error "Failed to install Docker prerequisites"
-    
-    progress "Setting up Docker GPG key"
-    install -m 0755 -d /etc/apt/keyrings || log_error "Failed to create keyrings directory"
-    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc || log_error "Failed to download Docker GPG key"
-    chmod a+r /etc/apt/keyrings/docker.asc || log_error "Failed to set permissions on Docker GPG key"
-    
-    progress "Adding Docker repository for Debian 13 Trixie"
-    tee /etc/apt/sources.list.d/docker.sources > /dev/null <<EOF
+write_docker_source() {
+    local suite="$1"
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log_info "DRY_RUN: would write Docker repository source for suite: $suite"
+        return 0
+    fi
+    install -m 0755 -d /etc/apt/keyrings >>"$LOG_FILE" 2>&1 || true
+    cat > /etc/apt/sources.list.d/docker.sources <<EOFDOCKER
 Types: deb
 URIs: https://download.docker.com/linux/debian
-Suites: trixie
+Suites: $suite
 Components: stable
 Signed-By: /etc/apt/keyrings/docker.asc
-EOF
-    
+EOFDOCKER
+}
+
+install_docker() {
+    progress "Removing old Docker packages"
+    exec_cmd "Removing old Docker packages" 1 "DEBIAN_FRONTEND=noninteractive apt-get remove -y docker.io docker-compose docker-doc podman-docker containerd runc" || true
+
+    apt_install_packages "Installing Docker prerequisites" ca-certificates curl gnupg
+    run_cmd "Setting up Docker GPG key" "error" 3 "install -m 0755 -d /etc/apt/keyrings && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && chmod a+r /etc/apt/keyrings/docker.asc"
+
+    progress "Adding Docker repository"
+    write_docker_source "$DOCKER_DEBIAN_SUITE"
+    log_success "Docker repository configured for Debian suite: $DOCKER_DEBIAN_SUITE"
+
+    APT_UPDATED=0
     progress "Updating package lists for Docker repository"
-    apt update || log_error "Failed to update package lists after adding Docker repository"
-    
-    progress "Installing Docker CE and plugins"
-    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || log_error "Failed to install Docker CE"
-    
-    progress "Adding user to docker group"
-    usermod -aG docker "$ACTUAL_USER" || log_error "Failed to add user to docker group"
-    
-    # Go
-    progress "Installing Go"
-    apt install -y golang-go || log_error "Failed to install Go"
-    
-    # Rust
-    progress "Installing Rust for user"
-    su - "$ACTUAL_USER" -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y' || log_error "Failed to install Rust for user"
-    
-    progress "Installing Rust for root"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y || log_error "Failed to install Rust for root"
-
-    # Source Rust environment with verification
-    progress "Verifying Rust environment"
-    if ! source "$ACTUAL_HOME/.cargo/env" 2>/dev/null; then
-        log_warning "Failed to source user Rust environment at $ACTUAL_HOME/.cargo/env"
+    if ! exec_cmd "Updating package lists for Docker repository" 2 "DEBIAN_FRONTEND=noninteractive apt-get update"; then
+        log_warning "Docker repo update failed for $DOCKER_DEBIAN_SUITE; trying bookworm fallback"
+        write_docker_source "bookworm"
+        exec_cmd "Updating package lists for Docker bookworm fallback" 2 "DEBIAN_FRONTEND=noninteractive apt-get update" || record_issue "warning" "Docker repository update" "$?" "apt-get update docker repo"
     fi
+    APT_UPDATED=1
 
-    if ! source /root/.cargo/env 2>/dev/null; then
-        log_warning "Failed to source root Rust environment"
-    fi
+    apt_install_packages "Installing Docker CE and plugins" docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    run_cmd "Enabling Docker service" "warning" 2 "systemctl enable --now docker"
+    run_cmd "Adding user to docker group" "warning" 1 "usermod -aG docker $(q "$ACTUAL_USER")"
+}
 
-    # Verify cargo is available
-    if ! command -v cargo &>/dev/null; then
-        log_error "Cargo not found in PATH after Rust installation"
+install_rust() {
+    if user_cmd_exists cargo; then
+        mark_skipped "Installing Rust for user"
     else
-        log_success "Rust and Cargo successfully configured"
+        run_as_user_cmd "Installing Rust for user" "error" 2 "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
     fi
 
-    # Install eza now that Rust/cargo is available
-    progress "Installing eza (modern ls)"
-    apt install -y eza || {
-        log_warning "eza not in repos, installing via cargo"
-        su - "$ACTUAL_USER" -c "source ~/.cargo/env && cargo install eza" || log_error "Failed to install eza"
-    }
+    if root_cmd_exists cargo; then
+        mark_skipped "Installing Rust for root"
+    else
+        run_cmd "Installing Rust for root" "warning" 2 "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+    fi
+
+    run_as_user_cmd "Verifying Rust environment" "warning" 1 "cargo --version"
+}
+
+install_dev_tools() {
+    section_header "Development Tools Installation"
+
+    apt_install_packages "Installing Python development tools" python3-full python3-pip python3-venv
+    apt_install_packages "Installing pipx" pipx
+    run_as_user_cmd "Ensuring pipx PATH for user" "warning" 1 "python3 -m pipx ensurepath || pipx ensurepath"
+
+    install_docker
+
+    apt_install_packages "Installing Go" golang-go
+    run_as_user_cmd "Preparing Go workspace" "warning" 1 "mkdir -p \"\$HOME/go/bin\""
+
+    install_rust
+
+    if root_cmd_exists eza || user_cmd_exists eza; then
+        mark_skipped "Installing eza modern ls"
+    else
+        progress "Installing eza modern ls"
+        if exec_cmd "Installing eza via APT" 1 "DEBIAN_FRONTEND=noninteractive apt-get install -y eza"; then
+            log_success "eza installed via APT"
+        else
+            log_warning "eza not available via APT; trying cargo fallback"
+            install_cargo_tool "Installing eza via cargo" eza eza
+        fi
+    fi
 
     log_success "Development tools installed"
 }
@@ -295,22 +684,18 @@ EOF
 ################################################################################
 configure_shell() {
     section_header "Shell Configuration"
-    
-    progress "Changing user shell to fish"
-    chsh -s /usr/bin/fish "$ACTUAL_USER" || log_error "Failed to change user shell"
-    
-    progress "Changing root shell to fish"
-    chsh -s /usr/bin/fish root || log_error "Failed to change root shell"
-    
-    progress "Setting up Starship for user"
-    mkdir -p "$ACTUAL_HOME/.config"
-    chown "$ACTUAL_USER":"$ACTUAL_USER" "$ACTUAL_HOME/.config"
-    su - "$ACTUAL_USER" -c "starship preset nerd-font-symbols -o ~/.config/starship.toml" || log_error "Failed to setup user Starship"
-    
-    progress "Setting up Starship for root"
-    mkdir -p /root/.config
-    starship preset nerd-font-symbols -o /root/.config/starship.toml || log_error "Failed to setup root Starship"
-    
+
+    local fish_path="/usr/bin/fish"
+    if command -v fish >/dev/null 2>&1; then
+        fish_path="$(command -v fish)"
+    fi
+
+    run_cmd "Changing user shell to fish" "warning" 1 "chsh -s $(q "$fish_path") $(q "$ACTUAL_USER")"
+    run_cmd "Changing root shell to fish" "warning" 1 "chsh -s $(q "$fish_path") root"
+
+    run_as_user_cmd "Setting up Starship for user" "warning" 1 "mkdir -p \"\$HOME/.config\" && starship preset nerd-font-symbols -o \"\$HOME/.config/starship.toml\""
+    run_cmd "Setting up Starship for root" "warning" 1 "mkdir -p /root/.config && starship preset nerd-font-symbols -o /root/.config/starship.toml"
+
     log_success "Shell configuration completed"
 }
 
@@ -319,11 +704,16 @@ configure_shell() {
 ################################################################################
 configure_fish_global() {
     section_header "Fish Global Configuration"
-    
     progress "Creating global fish config"
-    
-    cat > /etc/fish/config.fish << 'EOF'
-# Starship initialization (with availability check)
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log_info "DRY_RUN: would write /etc/fish/config.fish"
+        return 0
+    fi
+
+    mkdir -p /etc/fish
+    if cat > /etc/fish/config.fish <<'EOFFISH'
+# Starship initialization
 if command -v starship >/dev/null 2>&1
     starship init fish | source
 else
@@ -333,23 +723,18 @@ end
 # Disable fish greeting
 set -g fish_greeting
 
-# Eza aliases (with availability check)
+# Eza aliases with fallback
 if command -v eza >/dev/null 2>&1
     alias ls='eza --icons --group-directories-first'
     alias tree='eza --tree --icons'
-else
-    # Fallback to standard ls
-    alias ls='ls --color=auto'
-end
-
-# Fish abbreviations
-if command -v eza >/dev/null 2>&1
     abbr -a ll 'eza -la --icons --group-directories-first'
     abbr -a la 'eza -a --icons --group-directories-first'
 else
+    alias ls='ls --color=auto'
     abbr -a ll 'ls -la'
     abbr -a la 'ls -a'
 end
+
 abbr -a .. 'cd ..'
 abbr -a ... 'cd ../..'
 abbr -a .... 'cd ../../..'
@@ -371,20 +756,13 @@ abbr -a di 'docker images'
 abbr -a dex 'docker exec -it'
 abbr -a dlog 'docker logs -f'
 
-# Add Go binaries to PATH
-set -gx PATH $PATH /usr/local/go/bin
-set -gx PATH $PATH $HOME/go/bin
-
-# Add Cargo binaries to PATH
-set -gx PATH $PATH $HOME/.cargo/bin
-
-# Add local bin to PATH
-set -gx PATH $PATH $HOME/.local/bin
-
-# Set GOPATH
+# Toolchain PATH
+fish_add_path -g /usr/local/go/bin
+fish_add_path -g $HOME/go/bin
+fish_add_path -g $HOME/.cargo/bin
+fish_add_path -g $HOME/.local/bin
 set -gx GOPATH $HOME/go
 
-# System update function
 function update-system
     echo "Updating system..."
     sudo apt update
@@ -394,24 +772,23 @@ function update-system
     echo "System update complete!"
 end
 
-# Wordlist update function
 function update-wordlists
     echo "Updating wordlists..."
     set wordlist_dirs ~/wordlists/fuzzdb ~/wordlists/SecLists ~/wordlists/PayloadsAllTheThings ~/wordlists/Default-Accounts-Arsenal
     for dir in $wordlist_dirs
-        if test -d $dir
+        if test -d $dir/.git
             echo "Updating $dir"
-            git -C $dir pull
+            git -C $dir pull --ff-only
+        else if test -d $dir
+            echo "Skipping $dir: not a git repository"
         end
     end
     echo "Wordlists updated!"
 end
 
-# Tools update function
 function update-tools
     echo "Updating pentesting tools..."
 
-    # Update Go tools
     echo "Updating Go tools..."
     go install github.com/ffuf/ffuf/v2@latest
     go install github.com/projectdiscovery/httpx/cmd/httpx@latest
@@ -429,8 +806,8 @@ function update-tools
     go install github.com/nicocha30/ligolo-ng/cmd/agent@latest
     go install github.com/BishopFox/cloudfox@latest
     go install github.com/gitleaks/gitleaks/v8@latest
+    go install github.com/trufflesecurity/trufflehog/v3@latest
 
-    # Update Rust tools
     echo "Updating Rust tools..."
     cargo install feroxbuster --force
     cargo install rustscan --force
@@ -438,22 +815,20 @@ function update-tools
     cargo install rusthound --force
     cargo install eza --force
 
-    # Update pipx tools
     echo "Updating pipx tools..."
     pipx upgrade-all
 
-    # Update nuclei templates
-    echo "Updating nuclei templates..."
-    nuclei -update-templates
+    if command -v nuclei >/dev/null 2>&1
+        echo "Updating nuclei templates..."
+        nuclei -update-templates
+    end
 
-    # Update APT tools
     echo "Updating system packages..."
     sudo apt update && sudo apt upgrade -y
 
     echo "Tools update complete!"
 end
 
-# Python venv activation helper
 function venv
     if test -d ./venv
         source ./venv/bin/activate.fish
@@ -464,7 +839,6 @@ function venv
     end
 end
 
-# Tools navigation functions
 function toolsweb; cd ~/tools/web; end
 function toolsrecon; cd ~/tools/recon; end
 function toolsnetwork; cd ~/tools/network; end
@@ -475,9 +849,12 @@ function toolsauto; cd ~/tools/automation; end
 function toolsosint; cd ~/tools/osint; end
 function toolscloud; cd ~/tools/cloud; end
 function toolsmisc; cd ~/tools/misc; end
-EOF
-
-    log_success "Fish global configuration created"
+EOFFISH
+    then
+        log_success "Fish global configuration created"
+    else
+        record_issue "error" "Creating global fish config" 1 "/etc/fish/config.fish"
+    fi
 }
 
 ################################################################################
@@ -485,18 +862,11 @@ EOF
 ################################################################################
 create_directory_structure() {
     section_header "Creating Directory Structure"
-    
-    progress "Creating pentesting directories"
-    su - "$ACTUAL_USER" -c "mkdir -p ~/wordlists ~/pentests ~/tools/{web,recon,network,exploit,ad,privesc,automation,osint,cloud,misc}"
-    
-    progress "Creating monthly pentest directories"
-    su - "$ACTUAL_USER" -c 'for m in $(seq -f "%02g" 1 12); do mkdir -p ~/pentests/2026.$m; done'
-    
-    progress "Setting proper permissions"
-    find "$ACTUAL_HOME/tools" -type d -exec chmod 755 {} \; 2>/dev/null || true
-    find "$ACTUAL_HOME/wordlists" -type d -exec chmod 755 {} \; 2>/dev/null || true
-    find "$ACTUAL_HOME/pentests" -type d -exec chmod 755 {} \; 2>/dev/null || true
-    
+
+    run_as_user_cmd "Creating pentesting directories" "error" 1 "mkdir -p \"\$HOME/wordlists\" \"\$HOME/pentests\" \"\$HOME/tools\"/{web,recon,network,exploit,ad,privesc,automation,osint,cloud,misc}"
+    run_as_user_cmd "Creating monthly pentest directories" "warning" 1 "for m in \$(seq -f '%02g' 1 12); do mkdir -p \"\$HOME/pentests/$PENTEST_YEAR.\$m\"; done"
+    run_cmd "Setting proper permissions" "warning" 1 "find $(q "$ACTUAL_HOME/tools") $(q "$ACTUAL_HOME/wordlists") $(q "$ACTUAL_HOME/pentests") -type d -exec chmod 755 {} + 2>/dev/null || true"
+
     log_success "Directory structure created"
 }
 
@@ -506,22 +876,14 @@ create_directory_structure() {
 clone_wordlists() {
     section_header "Cloning Wordlist Repositories"
 
-    progress "Removing seclists package (if installed)"
-    apt remove -y seclists 2>/dev/null || log_info "seclists package not installed or already removed"
+    run_cmd "Removing seclists package if installed" "warning" 1 "DEBIAN_FRONTEND=noninteractive apt-get remove -y seclists"
+    clone_or_update_repo "Cloning fuzzdb" "https://github.com/fuzzdb-project/fuzzdb.git" "$ACTUAL_HOME/wordlists/fuzzdb" 1
+    clone_or_update_repo "Cloning SecLists" "https://github.com/danielmiessler/SecLists.git" "$ACTUAL_HOME/wordlists/SecLists" 1
+    clone_or_update_repo "Cloning PayloadsAllTheThings" "https://github.com/swisskyrepo/PayloadsAllTheThings.git" "$ACTUAL_HOME/wordlists/PayloadsAllTheThings" 1
+    clone_or_update_repo "Cloning Default-Accounts-Arsenal" "https://github.com/PekSec/Default-Accounts-Arsenal.git" "$ACTUAL_HOME/wordlists/Default-Accounts-Arsenal" 1
+    run_cmd "Fixing wordlist ownership" "warning" 1 "chown -R $(q "$ACTUAL_USER:$ACTUAL_USER") $(q "$ACTUAL_HOME/wordlists")"
 
-    progress "Cloning fuzzdb"
-    su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/fuzzdb-project/fuzzdb.git ~/wordlists/fuzzdb" || log_error "Failed to clone fuzzdb"
-
-    progress "Cloning SecLists"
-    su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/danielmiessler/SecLists.git ~/wordlists/SecLists" || log_error "Failed to clone SecLists"
-
-    progress "Cloning PayloadsAllTheThings"
-    su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/swisskyrepo/PayloadsAllTheThings.git ~/wordlists/PayloadsAllTheThings" || log_error "Failed to clone PayloadsAllTheThings"
-
-    progress "Cloning Default-Accounts-Arsenal"
-    su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/PekSec/Default-Accounts-Arsenal.git ~/wordlists/Default-Accounts-Arsenal" || log_error "Failed to clone Default-Accounts-Arsenal"
-    
-    log_success "Wordlist repositories cloned"
+    log_success "Wordlist repositories processed"
 }
 
 ################################################################################
@@ -529,44 +891,21 @@ clone_wordlists() {
 ################################################################################
 install_web_tools() {
     section_header "Installing Web Application Security Tools"
-    
-    # Go-based tools
-    progress "Installing ffuf"
-    su - "$ACTUAL_USER" -c "go install github.com/ffuf/ffuf/v2@latest" || log_error "Failed to install ffuf"
-    
-    progress "Installing httpx"
-    su - "$ACTUAL_USER" -c "go install github.com/projectdiscovery/httpx/cmd/httpx@latest" || log_error "Failed to install httpx"
-    
-    progress "Installing katana"
-    su - "$ACTUAL_USER" -c "go install github.com/projectdiscovery/katana/cmd/katana@latest" || log_error "Failed to install katana"
-    
-    progress "Installing nuclei"
-    su - "$ACTUAL_USER" -c "go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest" || log_error "Failed to install nuclei"
-    
-    progress "Installing dalfox"
-    su - "$ACTUAL_USER" -c "go install github.com/hahwul/dalfox/v2@latest" || log_error "Failed to install dalfox"
-    
-    # Rust-based tools
-    progress "Installing feroxbuster"
-    su - "$ACTUAL_USER" -c "source ~/.cargo/env && cargo install feroxbuster" || log_error "Failed to install feroxbuster"
 
-    # Python tools via pipx (isolated environments)
-    progress "Installing XSStrike with dependencies"
-    su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/s0md3v/XSStrike.git ~/tools/web/XSStrike && \
-        cd ~/tools/web/XSStrike && \
-        python3 -m pip install --user -r requirements.txt" || log_error "Failed to install XSStrike"
+    install_go_tool "Installing ffuf" ffuf "github.com/ffuf/ffuf/v2@latest"
+    install_go_tool "Installing httpx" httpx "github.com/projectdiscovery/httpx/cmd/httpx@latest"
+    install_go_tool "Installing katana" katana "github.com/projectdiscovery/katana/cmd/katana@latest"
+    install_go_tool "Installing nuclei" nuclei "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+    install_go_tool "Installing dalfox" dalfox "github.com/hahwul/dalfox/v2@latest"
 
-    progress "Installing Arjun"
-    su - "$ACTUAL_USER" -c "pipx install arjun" || log_error "Failed to install Arjun"
+    install_cargo_tool "Installing feroxbuster" feroxbuster feroxbuster
 
-    progress "Installing Corsy with dependencies"
-    su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/s0md3v/Corsy.git ~/tools/web/Corsy && \
-        cd ~/tools/web/Corsy && \
-        python3 -m pip install --user -r requirements.txt" || log_error "Failed to install Corsy"
+    install_pip_requirements_repo "Installing XSStrike" "https://github.com/s0md3v/XSStrike.git" "$ACTUAL_HOME/tools/web/XSStrike" "xsstrike.py"
+    install_pipx_tool "Installing Arjun" arjun arjun
+    install_pip_requirements_repo "Installing Corsy" "https://github.com/s0md3v/Corsy.git" "$ACTUAL_HOME/tools/web/Corsy" "corsy.py"
 
-    progress "Installing sqlmap"
-    apt install -y sqlmap || log_error "Failed to install sqlmap"
-    
+    apt_install_packages "Installing sqlmap" sqlmap
+
     log_success "Web tools installed"
 }
 
@@ -575,28 +914,15 @@ install_web_tools() {
 ################################################################################
 install_recon_tools() {
     section_header "Installing Reconnaissance & Enumeration Tools"
-    
-    progress "Installing subfinder"
-    su - "$ACTUAL_USER" -c "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest" || log_error "Failed to install subfinder"
-    
-    progress "Installing assetfinder"
-    su - "$ACTUAL_USER" -c "go install github.com/tomnomnom/assetfinder@latest" || log_error "Failed to install assetfinder"
-    
-    progress "Installing amass"
-    su - "$ACTUAL_USER" -c "go install github.com/owasp-amass/amass/v4/...@master" || log_error "Failed to install amass"
-    
-    progress "Installing puredns"
-    su - "$ACTUAL_USER" -c "go install github.com/d3mondev/puredns/v2@latest" || log_error "Failed to install puredns"
-    
-    progress "Installing dnsx"
-    su - "$ACTUAL_USER" -c "go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest" || log_error "Failed to install dnsx"
-    
-    progress "Installing naabu"
-    su - "$ACTUAL_USER" -c "go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest" || log_error "Failed to install naabu"
-    
-    progress "Installing rustscan"
-    su - "$ACTUAL_USER" -c "source ~/.cargo/env && cargo install rustscan" || log_error "Failed to install rustscan"
-    
+
+    install_go_tool "Installing subfinder" subfinder "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+    install_go_tool "Installing assetfinder" assetfinder "github.com/tomnomnom/assetfinder@latest"
+    install_go_tool "Installing amass" amass "github.com/owasp-amass/amass/v4/...@master"
+    install_go_tool "Installing puredns" puredns "github.com/d3mondev/puredns/v2@latest"
+    install_go_tool "Installing dnsx" dnsx "github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
+    install_go_tool "Installing naabu" naabu "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
+    install_cargo_tool "Installing rustscan" rustscan rustscan
+
     log_success "Recon tools installed"
 }
 
@@ -605,19 +931,12 @@ install_recon_tools() {
 ################################################################################
 install_network_tools() {
     section_header "Installing Network Analysis & Pivoting Tools"
-    
-    progress "Installing chisel"
-    su - "$ACTUAL_USER" -c "go install github.com/jpillora/chisel@latest" || log_error "Failed to install chisel"
-    
-    progress "Installing ligolo-ng proxy"
-    su - "$ACTUAL_USER" -c "go install github.com/nicocha30/ligolo-ng/cmd/proxy@latest" || log_error "Failed to install ligolo-ng proxy"
-    
-    progress "Installing ligolo-ng agent"
-    su - "$ACTUAL_USER" -c "go install github.com/nicocha30/ligolo-ng/cmd/agent@latest" || log_error "Failed to install ligolo-ng agent"
-    
-    progress "Installing rustcat"
-    su - "$ACTUAL_USER" -c "source ~/.cargo/env && cargo install rustcat" || log_error "Failed to install rustcat"
-    
+
+    install_go_tool "Installing chisel" chisel "github.com/jpillora/chisel@latest"
+    install_go_tool "Installing ligolo-ng proxy" proxy "github.com/nicocha30/ligolo-ng/cmd/proxy@latest"
+    install_go_tool "Installing ligolo-ng agent" agent "github.com/nicocha30/ligolo-ng/cmd/agent@latest"
+    install_cargo_tool "Installing rustcat" rustcat rustcat
+
     log_success "Network tools installed"
 }
 
@@ -628,16 +947,23 @@ install_exploit_tools() {
     section_header "Installing Exploitation & C2 Frameworks"
 
     progress "Installing Sliver C2 Framework"
-    curl https://sliver.sh/install | su - "$ACTUAL_USER" -c "bash" || {
-        log_warning "Failed to install via script, cloning repository"
-        su - "$ACTUAL_USER" -c "git clone https://github.com/BishopFox/sliver.git ~/tools/exploit/sliver" || log_error "Failed to clone sliver"
-    }
+    local user_q home_q sliver_target
+    user_q="$(q "$ACTUAL_USER")"
+    home_q="$(q "$ACTUAL_HOME")"
+    sliver_target="$ACTUAL_HOME/tools/exploit/sliver"
 
-    progress "Installing impacket"
-    su - "$ACTUAL_USER" -c "pipx install impacket" || log_error "Failed to install impacket"
+    if user_cmd_exists sliver-server || [[ -d "$sliver_target/.git" ]]; then
+        log_success "Sliver already appears to be installed or cloned"
+        ((SKIPPED_COUNT++))
+    elif exec_cmd "Installing Sliver via official script" 2 "curl -fsSL https://sliver.sh/install | runuser -u $user_q -- env HOME=$home_q bash"; then
+        log_success "Sliver installed via official script"
+    else
+        log_warning "Sliver official installer failed; cloning repository fallback"
+        clone_or_update_repo "Cloning Sliver fallback" "https://github.com/BishopFox/sliver.git" "$sliver_target" 1
+    fi
 
-    progress "Installing Metasploit Framework"
-    apt install -y metasploit-framework || log_error "Failed to install Metasploit Framework"
+    install_pipx_tool "Installing impacket" impacket-GetNPUsers impacket
+    apt_install_packages "Installing Metasploit Framework" metasploit-framework
 
     log_success "Exploitation tools installed"
 }
@@ -647,28 +973,16 @@ install_exploit_tools() {
 ################################################################################
 install_ad_tools() {
     section_header "Installing Active Directory Tools"
-    
-    progress "Installing Neo4j"
-    apt install -y neo4j || log_error "Failed to install Neo4j"
 
-    progress "Enabling Neo4j service"
-    systemctl enable neo4j &>/dev/null || log_warning "Failed to enable Neo4j service"
+    apt_install_packages "Installing Neo4j" neo4j
+    run_cmd "Enabling Neo4j service" "warning" 2 "systemctl enable neo4j"
+    run_cmd "Starting Neo4j service" "warning" 2 "systemctl start neo4j"
 
-    progress "Starting Neo4j service"
-    systemctl start neo4j &>/dev/null || log_warning "Failed to start Neo4j - start manually with: sudo systemctl start neo4j"
+    clone_or_update_repo "Cloning BloodHound" "https://github.com/SpecterOps/BloodHound.git" "$ACTUAL_HOME/tools/ad/BloodHound" 1
+    install_cargo_tool "Installing RustHound" rusthound rusthound
+    install_pipx_tool "Installing Certipy" certipy certipy-ad
+    install_pipx_tool "Installing Coercer" Coercer "git+https://github.com/p0dalirius/Coercer.git"
 
-    progress "Cloning BloodHound"
-    su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/SpecterOps/BloodHound.git ~/tools/ad/BloodHound" || log_error "Failed to clone BloodHound"
-    
-    progress "Installing RustHound"
-    su - "$ACTUAL_USER" -c "source ~/.cargo/env && cargo install rusthound" || log_error "Failed to install RustHound"
-    
-    progress "Installing Certipy"
-    su - "$ACTUAL_USER" -c "pipx install certipy-ad" || log_error "Failed to install Certipy"
-
-    progress "Installing Coercer"
-    su - "$ACTUAL_USER" -c "pipx install git+https://github.com/p0dalirius/Coercer.git" || log_error "Failed to install Coercer"
-    
     log_success "Active Directory tools installed"
 }
 
@@ -678,12 +992,12 @@ install_ad_tools() {
 install_privesc_tools() {
     section_header "Installing Privilege Escalation Tools"
 
-    progress "Cloning PEASS-ng"
-    su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/carlospolop/PEASS-ng ~/tools/privesc/PEASS-ng && chmod +x ~/tools/privesc/PEASS-ng/linPEAS/linpeas.sh" || log_error "Failed to clone PEASS-ng"
+    clone_or_update_repo "Cloning PEASS-ng" "https://github.com/carlospolop/PEASS-ng" "$ACTUAL_HOME/tools/privesc/PEASS-ng" 1
+    run_as_user_cmd "Making linpeas executable" "warning" 1 "chmod +x \"\$HOME/tools/privesc/PEASS-ng/linPEAS/linpeas.sh\" 2>/dev/null || true"
 
-    progress "Cloning linux-exploit-suggester"
-    su - "$ACTUAL_USER" -c "git clone --depth 1 https://github.com/The-Z-Labs/linux-exploit-suggester ~/tools/privesc/linux-exploit-suggester && chmod +x ~/tools/privesc/linux-exploit-suggester/linux-exploit-suggester.sh" || log_error "Failed to clone linux-exploit-suggester"
-    
+    clone_or_update_repo "Cloning linux-exploit-suggester" "https://github.com/The-Z-Labs/linux-exploit-suggester" "$ACTUAL_HOME/tools/privesc/linux-exploit-suggester" 1
+    run_as_user_cmd "Making linux-exploit-suggester executable" "warning" 1 "chmod +x \"\$HOME/tools/privesc/linux-exploit-suggester/linux-exploit-suggester.sh\" 2>/dev/null || true"
+
     log_success "Privilege escalation tools installed"
 }
 
@@ -693,8 +1007,7 @@ install_privesc_tools() {
 install_automation_tools() {
     section_header "Installing Automation Frameworks"
 
-    progress "Installing AutoRecon"
-    su - "$ACTUAL_USER" -c "pipx install git+https://github.com/Tib3rius/AutoRecon.git" || log_error "Failed to install AutoRecon"
+    install_pipx_tool "Installing AutoRecon" autorecon "git+https://github.com/Tib3rius/AutoRecon.git"
 
     log_success "Automation tools installed"
 }
@@ -704,16 +1017,11 @@ install_automation_tools() {
 ################################################################################
 install_osint_tools() {
     section_header "Installing OSINT Tools"
-    
-    progress "Installing sherlock"
-    su - "$ACTUAL_USER" -c "pipx install sherlock-project" || log_error "Failed to install sherlock"
 
-    progress "Installing holehe"
-    su - "$ACTUAL_USER" -c "pipx install git+https://github.com/megadose/holehe.git" || log_error "Failed to install holehe"
+    install_pipx_tool "Installing sherlock" sherlock sherlock-project
+    install_pipx_tool "Installing holehe" holehe "git+https://github.com/megadose/holehe.git"
+    install_pipx_tool "Installing h8mail" h8mail h8mail
 
-    progress "Installing h8mail"
-    su - "$ACTUAL_USER" -c "pipx install h8mail" || log_error "Failed to install h8mail"
-    
     log_success "OSINT tools installed"
 }
 
@@ -724,22 +1032,20 @@ install_cloud_tools() {
     section_header "Installing Cloud & Container Security Tools"
 
     progress "Installing trivy"
-    apt install -y trivy || {
-        log_warning "trivy not in repos, installing from official script"
-        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin || log_error "Failed to install trivy"
-    }
+    if root_cmd_exists trivy; then
+        log_success "trivy already available"
+        ((SKIPPED_COUNT++))
+    elif exec_cmd "Installing trivy via APT" 1 "DEBIAN_FRONTEND=noninteractive apt-get install -y trivy"; then
+        log_success "trivy installed via APT"
+    else
+        log_warning "trivy not available via APT; using official install script fallback"
+        run_cmd "Installing trivy via official script" "error" 2 "curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin"
+    fi
 
-    progress "Installing kube-hunter"
-    su - "$ACTUAL_USER" -c "pipx install kube-hunter" || log_error "Failed to install kube-hunter"
-
-    progress "Installing CloudFox"
-    su - "$ACTUAL_USER" -c "go install github.com/BishopFox/cloudfox@latest" || log_error "Failed to install CloudFox"
-
-    progress "Installing ScoutSuite"
-    su - "$ACTUAL_USER" -c "pipx install scoutsuite" || log_error "Failed to install ScoutSuite"
-
-    progress "Installing Prowler"
-    su - "$ACTUAL_USER" -c "pipx install prowler" || log_error "Failed to install Prowler"
+    install_pipx_tool "Installing kube-hunter" kube-hunter kube-hunter
+    install_go_tool "Installing CloudFox" cloudfox "github.com/BishopFox/cloudfox@latest"
+    install_pipx_tool "Installing ScoutSuite" scout scoutsuite
+    install_pipx_tool "Installing Prowler" prowler prowler
 
     log_success "Cloud tools installed"
 }
@@ -749,19 +1055,26 @@ install_cloud_tools() {
 ################################################################################
 install_misc_tools() {
     section_header "Installing Miscellaneous Tools"
-    
-    progress "Installing Ciphey"
-    su - "$ACTUAL_USER" -c "pipx install ciphey" || log_error "Failed to install Ciphey"
-    
-    progress "Installing haiti"
-    su - "$ACTUAL_USER" -c "pipx install haiti-hash" || log_error "Failed to install haiti"
 
-    progress "Installing GitLeaks"
-    su - "$ACTUAL_USER" -c "go install github.com/gitleaks/gitleaks/v8@latest" || log_error "Failed to install GitLeaks"
+    install_pipx_tool "Installing Ciphey" ciphey ciphey
+    install_pipx_tool "Installing haiti" haiti haiti-hash
+    install_go_tool "Installing GitLeaks" gitleaks "github.com/gitleaks/gitleaks/v8@latest"
 
-    progress "Installing TruffleHog"
-    su - "$ACTUAL_USER" -c "pipx install trufflehog" || log_error "Failed to install TruffleHog"
-    
+    if user_cmd_exists trufflehog; then
+        mark_skipped "Installing TruffleHog"
+    else
+        progress "Installing TruffleHog"
+        local truffle_cmd truffle_cmd_q
+        truffle_cmd='export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.cargo/bin:/usr/local/go/bin:$PATH"; python3 -m pipx install trufflehog || pipx install trufflehog'
+        truffle_cmd_q="$(q "$truffle_cmd")"
+        if exec_cmd "Installing TruffleHog via pipx" 1 "runuser -u $(q "$ACTUAL_USER") -- env HOME=$(q "$ACTUAL_HOME") bash -lc $truffle_cmd_q"; then
+            log_success "TruffleHog installed via pipx"
+        else
+            log_warning "TruffleHog pipx install failed; trying Go fallback"
+            install_go_tool "Installing TruffleHog via Go" trufflehog "github.com/trufflesecurity/trufflehog/v3@latest"
+        fi
+    fi
+
     log_success "Miscellaneous tools installed"
 }
 
@@ -770,16 +1083,16 @@ install_misc_tools() {
 ################################################################################
 post_install_config() {
     section_header "Post-Installation Configuration"
-    
-    progress "Initializing nuclei templates"
-    su - "$ACTUAL_USER" -c "nuclei -update-templates" || log_warning "Failed to update nuclei templates"
-    
-    progress "Creating subfinder config directory"
-    su - "$ACTUAL_USER" -c "mkdir -p ~/.config/subfinder" || log_warning "Failed to create subfinder config"
-    
-    progress "Creating amass config directory"
-    su - "$ACTUAL_USER" -c "mkdir -p ~/.config/amass" || log_warning "Failed to create amass config"
-    
+
+    if user_cmd_exists nuclei; then
+        run_as_user_cmd "Initializing nuclei templates" "warning" 2 "nuclei -update-templates"
+    else
+        record_issue "warning" "Initializing nuclei templates skipped because nuclei is missing" 127 "nuclei -update-templates"
+    fi
+
+    run_as_user_cmd "Creating subfinder config directory" "warning" 1 "mkdir -p \"\$HOME/.config/subfinder\""
+    run_as_user_cmd "Creating amass config directory" "warning" 1 "mkdir -p \"\$HOME/.config/amass\""
+
     log_success "Post-installation configuration completed"
 }
 
@@ -788,10 +1101,15 @@ post_install_config() {
 ################################################################################
 create_documentation() {
     section_header "Creating Documentation"
-    
     progress "Creating tools README"
-    
-    cat > "$ACTUAL_HOME/tools/README.md" << 'EOFREADME'
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log_info "DRY_RUN: would write $ACTUAL_HOME/tools/README.md"
+        return 0
+    fi
+
+    mkdir -p "$ACTUAL_HOME/tools"
+    if cat > "$ACTUAL_HOME/tools/README.md" <<'EOFREADME'
 # Tools Directory
 
 ## Structure
@@ -808,52 +1126,17 @@ create_documentation() {
 
 ## Tool Locations
 
-### Command-Line Tools (automatically in PATH)
-- **Go tools** → `~/go/bin/`: ffuf, httpx, katana, nuclei, dalfox, subfinder, assetfinder, amass, puredns, dnsx, naabu, chisel, ligolo-ng (proxy+agent)
-- **Rust tools** → `~/.cargo/bin/`: feroxbuster, rustscan, rustcat, rusthound, eza
-- **Pipx tools** → `~/.local/bin/`: impacket, certipy-ad, coercer, autorecon, sherlock, holehe, h8mail, ciphey, haiti, kube-hunter, arjun
-- **APT packages** → `/usr/bin/`: sqlmap, neo4j, trivy
+### Command-Line Tools
+- **Go tools** -> `~/go/bin/`: ffuf, httpx, katana, nuclei, dalfox, subfinder, assetfinder, amass, puredns, dnsx, naabu, chisel, ligolo-ng proxy/agent, cloudfox, gitleaks, trufflehog fallback
+- **Rust tools** -> `~/.cargo/bin/`: feroxbuster, rustscan, rustcat, rusthound, eza fallback
+- **Pipx tools** -> `~/.local/bin/`: impacket, certipy-ad, coercer, autorecon, sherlock, holehe, h8mail, ciphey, haiti, kube-hunter, arjun, scoutsuite, prowler
+- **APT packages** -> `/usr/bin/`: sqlmap, neo4j, trivy, metasploit-framework, docker
 
-### Repository Clones (for manual execution or building)
-- **~/tools/web/**: XSStrike, Corsy (with Python dependencies installed)
-- **~/tools/ad/**: BloodHound (requires: cd ~/tools/ad/BloodHound && npm install && npm run build)
+### Repository Clones
+- **~/tools/web/**: XSStrike, Corsy
+- **~/tools/ad/**: BloodHound
 - **~/tools/privesc/**: PEASS-ng, linux-exploit-suggester
-- **~/tools/exploit/**: sliver (if official installer failed, requires: cd ~/tools/exploit/sliver && make)
-
-## Installed Tools Summary
-
-### Web Tools (10)
-- **Go**: ffuf, httpx, katana, nuclei, dalfox
-- **Rust**: feroxbuster
-- **Python**: XSStrike, Arjun, Corsy
-- **APT**: sqlmap
-
-### Recon Tools (7)
-- subfinder, assetfinder, amass, puredns, dnsx, naabu, rustscan
-
-### Network Tools (4)
-- chisel, ligolo-ng (proxy+agent), rustcat
-
-### Exploitation Tools (2)
-- Sliver C2, impacket
-
-### Active Directory Tools (5)
-- Neo4j, BloodHound, RustHound, Certipy, Coercer
-
-### Privilege Escalation (2)
-- PEASS-ng, linux-exploit-suggester
-
-### Automation (1)
-- AutoRecon
-
-### OSINT Tools (3)
-- sherlock, holehe, h8mail
-
-### Cloud Tools (2)
-- trivy, kube-hunter
-
-### Miscellaneous (2)
-- Ciphey, haiti
+- **~/tools/exploit/**: Sliver fallback clone if official installer failed
 
 ## Update Commands
 - `update-tools` - Update all pentesting tools
@@ -861,45 +1144,28 @@ create_documentation() {
 - `update-system` - Update system packages
 
 ## Navigation Shortcuts
-- `toolsweb` - Navigate to ~/tools/web
-- `toolsrecon` - Navigate to ~/tools/recon
-- `toolsnetwork` - Navigate to ~/tools/network
-- `toolsexploit` - Navigate to ~/tools/exploit
-- `toolsad` - Navigate to ~/tools/ad
-- `toolsprivesc` - Navigate to ~/tools/privesc
-- `toolsauto` - Navigate to ~/tools/automation
-- `toolsosint` - Navigate to ~/tools/osint
-- `toolscloud` - Navigate to ~/tools/cloud
-- `toolsmisc` - Navigate to ~/tools/misc
+- `toolsweb`, `toolsrecon`, `toolsnetwork`, `toolsexploit`, `toolsad`, `toolsprivesc`, `toolsauto`, `toolsosint`, `toolscloud`, `toolsmisc`
 
 ## Tools Requiring API Keys
-- **subfinder**: ~/.config/subfinder/provider-config.yaml
-- **amass**: ~/.config/amass/config.ini
+- **subfinder**: `~/.config/subfinder/provider-config.yaml`
+- **amass**: `~/.config/amass/config.ini`
 
 ## BloodHound Setup
 1. Start Neo4j: `sudo systemctl start neo4j`
-2. Access Neo4j: http://localhost:7474
-3. Default credentials: neo4j/neo4j (change on first login)
-4. Launch BloodHound: Check build instructions in ~/tools/ad/BloodHound
-5. Collect data with RustHound: `rusthound [options]`
+2. Access Neo4j: `http://localhost:7474`
+3. Default credentials: `neo4j/neo4j`; change on first login.
+4. Launch or build BloodHound according to the repository instructions in `~/tools/ad/BloodHound`.
+5. Collect data with RustHound: `rusthound [options]`.
 
-## Tools Notes
-
-### Sliver C2 Framework
-- **Installation**: Installed via official script (https://sliver.sh/install)
-- **Fallback**: If script fails, cloned to ~/tools/exploit/sliver (requires `make`)
-
-### BloodHound CE
-- **Location**: ~/tools/ad/BloodHound
-- **Note**: Requires manual build, check README.md in the repository
-
-### XSStrike & Corsy
-- **Locations**: ~/tools/web/XSStrike, ~/tools/web/Corsy
-- **Usage**: Run directly with Python (dependencies via requirements.txt handled during clone)
+## Soft-Fail Behavior
+This setup script continues after individual failures. Review the terminal summary and `~/kali-setup.log` after each run. Re-running the script is safe for most steps: existing repositories are updated, existing tools are skipped, and failed package-manager states are repaired before retry.
 EOFREADME
-
-    chown "$ACTUAL_USER":"$ACTUAL_USER" "$ACTUAL_HOME/tools/README.md"
-    log_success "Documentation created"
+    then
+        chown "$ACTUAL_USER:$ACTUAL_USER" "$ACTUAL_HOME/tools/README.md" 2>/dev/null || true
+        log_success "Documentation created"
+    else
+        record_issue "error" "Creating tools README" 1 "$ACTUAL_HOME/tools/README.md"
+    fi
 }
 
 ################################################################################
@@ -907,98 +1173,123 @@ EOFREADME
 ################################################################################
 cleanup() {
     section_header "System Cleanup"
-    
-    progress "Running autoremove"
-    apt autoremove -y || log_warning "Autoremove failed"
-    
-    progress "Running autoclean"
-    apt autoclean || log_warning "Autoclean failed"
-    
+
+    run_cmd "Running autoremove" "warning" 1 "DEBIAN_FRONTEND=noninteractive apt-get autoremove -y"
+    run_cmd "Running autoclean" "warning" 1 "apt-get autoclean"
+
     log_success "Cleanup completed"
 }
 
 ################################################################################
 # VERIFICATION
 ################################################################################
+verify_user_tool() {
+    local tool="$1"
+    if user_cmd_exists "$tool"; then
+        log_success "$tool found in user PATH"
+        return 0
+    fi
+
+    record_issue "warning" "$tool not found in user PATH" 127 "command -v $tool"
+    return 0
+}
+
+verify_root_tool() {
+    local tool="$1"
+    if root_cmd_exists "$tool"; then
+        log_success "$tool found in root PATH"
+        return 0
+    fi
+
+    record_issue "warning" "$tool not found in root PATH" 127 "command -v $tool"
+    return 0
+}
+
 verify_installation() {
     section_header "Verification Tests"
 
-    local verification_errors=0
-
     progress "Testing Go tools"
-    for tool in httpx nuclei ffuf subfinder; do
-        if su - "$ACTUAL_USER" -c "command -v $tool" &>/dev/null; then
-            log_success "$tool found in PATH"
-        else
-            log_error "$tool not found - installation may have failed"
-            ((verification_errors++))
-        fi
+    local go_tools=(httpx nuclei ffuf subfinder katana dalfox dnsx naabu chisel cloudfox gitleaks)
+    local tool
+    for tool in "${go_tools[@]}"; do
+        verify_user_tool "$tool"
     done
 
     progress "Testing Rust tools"
-    for tool in feroxbuster rustscan; do
-        if su - "$ACTUAL_USER" -c "command -v $tool" &>/dev/null; then
-            log_success "$tool found in PATH"
-        else
-            log_error "$tool not found - installation may have failed"
-            ((verification_errors++))
-        fi
+    local rust_tools=(feroxbuster rustscan rustcat rusthound)
+    for tool in "${rust_tools[@]}"; do
+        verify_user_tool "$tool"
     done
 
-    progress "Testing Python tools"
-    if su - "$ACTUAL_USER" -c "pipx list" &>/dev/null; then
-        log_success "pipx tools installed"
-    else
-        log_error "pipx tools not found"
-        ((verification_errors++))
-    fi
+    progress "Testing Python/pipx tools"
+    local pipx_tools=(arjun certipy autorecon sherlock holehe h8mail ciphey haiti prowler)
+    for tool in "${pipx_tools[@]}"; do
+        verify_user_tool "$tool"
+    done
 
-    progress "Verifying Neo4j"
-    if systemctl status neo4j &>/dev/null; then
+    progress "Testing APT/root tools"
+    local root_tools=(sqlmap docker neo4j)
+    for tool in "${root_tools[@]}"; do
+        verify_root_tool "$tool"
+    done
+
+    progress "Verifying Neo4j service"
+    if systemctl is-active --quiet neo4j; then
         log_success "Neo4j service active"
     else
-        log_warning "Neo4j not active (will be started manually)"
+        record_issue "warning" "Neo4j service is not active" 1 "systemctl is-active neo4j"
     fi
 
-    if [[ $verification_errors -gt 0 ]]; then
-        log_error "Verification completed with $verification_errors failures"
-    else
-        log_success "All critical tools verified successfully"
-    fi
+    log_success "Verification completed"
 }
 
 ################################################################################
 # FINAL SUMMARY
 ################################################################################
 display_summary() {
-    local end_time=$(date +%s)
-    local elapsed=$((end_time - SCRIPT_START_TIME))
-    local minutes=$((elapsed / 60))
-    local seconds=$((elapsed % 60))
-    
+    local end_time elapsed minutes seconds
+    end_time=$(date +%s)
+    elapsed=$((end_time - SCRIPT_START_TIME))
+    minutes=$((elapsed / 60))
+    seconds=$((elapsed % 60))
+
     section_header "Installation Summary"
-    
-    echo -e "${GREEN}Installation completed in ${minutes}m ${seconds}s${NC}"
+
+    echo -e "${GREEN}Installation workflow completed in ${minutes}m ${seconds}s${NC}"
     echo ""
-    echo -e "${YELLOW}Errors encountered: $ERROR_COUNT${NC}"
+    echo -e "${CYAN}Run statistics:${NC}"
+    echo "  - Steps attempted: $CURRENT_STEP"
+    echo "  - Soft errors: $ERROR_COUNT"
+    echo "  - Warnings: $WARNING_COUNT"
+    echo "  - Self-heal attempts: $SELF_HEAL_COUNT"
+    echo "  - Skipped as already satisfied: $SKIPPED_COUNT"
+    echo "  - Log file: $LOG_FILE"
     echo ""
-    echo -e "${CYAN}Statistics:${NC}"
-    echo "  - Total tools installed: 47"
-    echo "  - Wordlist repositories: 4"
-    echo "  - Directory categories: 10"
-    echo "  - Go tools: 16 (+ cloudfox, gitleaks)"
-    echo "  - Rust tools: 5 (feroxbuster, rustscan, rustcat, rusthound, eza)"
-    echo "  - Pipx tools: 14 (+ scoutsuite, prowler, trufflehog)"
-    echo "  - APT tools: 4 (sqlmap, neo4j, trivy, metasploit-framework)"
-    echo "  - Git clone tools: 5 (XSStrike, Corsy, BloodHound, PEASS-ng, linux-exploit-suggester)"
-    echo "  - Build dependencies: Node.js, build-essential, make"
-    echo ""
+
+    if [[ ${#FAILED_ACTIONS[@]} -gt 0 ]]; then
+        echo -e "${RED}${BOLD}Soft errors requiring review:${NC}"
+        local item
+        for item in "${FAILED_ACTIONS[@]}"; do
+            echo "  - $item"
+        done
+        echo ""
+    fi
+
+    if [[ ${#WARNING_ACTIONS[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}${BOLD}Warnings:${NC}"
+        local item
+        for item in "${WARNING_ACTIONS[@]}"; do
+            echo "  - $item"
+        done
+        echo ""
+    fi
+
     echo -e "${BOLD}${MAGENTA}MANUAL STEPS REQUIRED:${NC}"
     echo ""
     echo -e "${YELLOW}1. Log out and log back in for:${NC}"
-    echo "   - Shell changes to take effect"
+    echo "   - Shell change to fish"
     echo "   - Docker group membership activation"
-    echo "   - PATH changes to be applied"
+    echo "   - PATH changes from pipx, Go and Cargo"
     echo ""
     echo -e "${YELLOW}2. Configure API keys for:${NC}"
     echo "   - subfinder: ~/.config/subfinder/provider-config.yaml"
@@ -1007,50 +1298,51 @@ display_summary() {
     echo -e "${YELLOW}3. Setup Neo4j for BloodHound:${NC}"
     echo "   - sudo systemctl start neo4j"
     echo "   - Visit http://localhost:7474"
-    echo "   - Change default password (neo4j/neo4j)"
+    echo "   - Change default password neo4j/neo4j"
     echo ""
-    echo -e "${YELLOW}4. Build required tools:${NC}"
+    echo -e "${YELLOW}4. Build required tools when needed:${NC}"
     echo "   - BloodHound: cd ~/tools/ad/BloodHound && npm install && npm run build"
-    echo "   - Sliver: Only if official installer failed: cd ~/tools/exploit/sliver && make"
+    echo "   - Sliver fallback: cd ~/tools/exploit/sliver && make"
     echo ""
-    echo -e "${YELLOW}5. Test your setup:${NC}"
-    echo "   - Open new terminal"
-    echo "   - Run: httpx -version"
-    echo "   - Run: nuclei -version"
-    echo "   - Run: toolsweb (should navigate to ~/tools/web)"
+    echo -e "${YELLOW}5. Smoke test after a new login shell:${NC}"
+    echo "   - httpx -version"
+    echo "   - nuclei -version"
+    echo "   - toolsweb"
     echo ""
-    echo -e "${CYAN}Configuration Files:${NC}"
-    echo "  - Fish config: /etc/fish/config.fish"
-    echo "  - Starship (user): ~/.config/starship.toml"
-    echo "  - Starship (root): /root/.config/starship.toml"
-    echo "  - Tools README: ~/tools/README.md"
-    echo "  - Log file: $LOG_FILE"
-    echo ""
-    echo -e "${GREEN}Setup completed successfully!${NC}"
+
+    if [[ $ERROR_COUNT -eq 0 ]]; then
+        echo -e "${GREEN}Setup completed with no soft errors.${NC}"
+    else
+        echo -e "${YELLOW}Setup completed with soft errors. Review the summary and rerun after correcting blockers.${NC}"
+    fi
 }
 
 ################################################################################
 # MAIN EXECUTION
 ################################################################################
 main() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${BOLD}${MAGENTA}"
-    cat << 'EOF'
+    cat <<'EOFBANNER'
     ╔═══════════════════════════════════════════════════════════════╗
     ║                                                               ║
     ║        Kali Linux Complete Setup Script                       ║
-    ║        Author: Barış PEKALP                                   ║
-    ║        Version: 2.0                                           ║
+    ║        Soft-Fail / Self-Healing Refactor                      ║
+    ║        Version: 3.0                                           ║
     ║                                                               ║
     ╚═══════════════════════════════════════════════════════════════╝
-EOF
+EOFBANNER
     echo -e "${NC}"
-    
-    log "Starting Kali Linux setup at $(date)"
-    
-    # Execute all functions in order
-    check_privileges
+
+    check_privileges "$@"
     parse_arguments "$@"
+    log "Starting Kali Linux setup at $(date)"
+
+    if [[ "$SOFT_ABORT" == "1" ]]; then
+        display_summary
+        return 0
+    fi
+
     install_certificate
     update_system
     install_shell
@@ -1074,9 +1366,11 @@ EOF
     cleanup
     verify_installation
     display_summary
-    
+
     log "Setup completed at $(date)"
 }
 
-# Run main function
 main "$@"
+
+# Always return success to callers because failures are intentionally soft-reported.
+exit 0
