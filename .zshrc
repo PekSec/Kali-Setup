@@ -300,7 +300,7 @@ alias klf='kubectl logs -f'
 # Generic aliases
 # -------------------------------------------------------------------
 alias grep='grep --color=auto'
-alias ip='ip --color=auto'
+alias ip='ip -c'
 alias mkdir='mkdir -p'
 alias reload-zsh='source ~/.zshrc'
 alias zshconfig='$EDITOR ~/.zshrc'

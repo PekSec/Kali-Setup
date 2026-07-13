@@ -453,6 +453,22 @@ install_go_tool() {
     run_as_user_cmd "$description" "error" 2 "go install $(q "$module")"
 }
 
+# Like install_go_tool but detects the installed binary by its explicit path in
+# the user's Go bin dir, avoiding false skips from unrelated binaries in PATH
+# (ligolo-ng ships generically named "proxy"/"agent" executables).
+install_ligolo_tool() {
+    local description="$1"
+    local binary="$2"
+    local module="$3"
+
+    if [[ "$FORCE_REINSTALL" != "1" ]] && [[ -x "$ACTUAL_HOME/go/bin/$binary" ]]; then
+        mark_skipped "$description"
+        return 0
+    fi
+
+    run_as_user_cmd "$description" "error" 2 "go install $(q "$module")"
+}
+
 install_cargo_tool() {
     local description="$1"
     local binary="$2"
@@ -484,15 +500,33 @@ install_pip_requirements_repo() {
     local repo="$2"
     local target="$3"
     local entry_file="${4:-}"
-    
+
+    # Always pull the repository so the tool folder exists regardless of the
+    # dependency-install outcome.
     clone_or_update_repo "$description - repository" "$repo" "$target" 1
-    
-    local install_cmd="cd $(q "$target") && python3 -m pip install --user -r requirements.txt"
-    run_as_user_cmd "$description - Python requirements" "warning" 2 "$install_cmd"
-    
+
     if [[ -n "$entry_file" ]]; then
         run_as_user_cmd "$description - executable bit" "warning" 1 "chmod +x $(q "$target/$entry_file") 2>/dev/null || true"
     fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log_info "DRY_RUN: would attempt isolated pipx install for $description from $target"
+        return 0
+    fi
+
+    # Attempt an isolated install with pipx. pipx manages its own venv, so this
+    # neither touches system packages (no externally-managed-environment error)
+    # nor forces the user to manage a venv. Script-style repos without packaging
+    # metadata will fail here, which is expected and handled below.
+    if run_as_user_cmd "$description - isolated pipx install" "warning" 1 "python3 -m pipx install $(q "$target") || pipx install $(q "$target")"; then
+        if user_cmd_exists "$(basename "$target")"; then
+            return 0
+        fi
+    fi
+
+    # Fallback: leave the clone in place and tell the user to create their own
+    # venv. We deliberately avoid --break-system-packages and any auto-venv.
+    record_issue "warning" "$description - dependencies not auto-installed; create a venv in $target and run 'pip install -r requirements.txt'" 1 "manual: python3 -m venv $target/.venv && $target/.venv/bin/pip install -r $target/requirements.txt"
 }
 
 ################################################################################
@@ -861,8 +895,10 @@ install_network_tools() {
     section_header "Installing Network Analysis & Pivoting Tools"
     
     install_go_tool "Installing chisel" chisel "github.com/jpillora/chisel@latest"
-    install_go_tool "Installing ligolo-ng proxy" proxy "github.com/nicocha30/ligolo-ng/cmd/proxy@latest"
-    install_go_tool "Installing ligolo-ng agent" agent "github.com/nicocha30/ligolo-ng/cmd/agent@latest"
+    # ligolo-ng installs binaries named "proxy"/"agent" - too generic for a PATH
+    # skip check, so detect them by their explicit path in the Go bin directory.
+    install_ligolo_tool "Installing ligolo-ng proxy" proxy "github.com/nicocha30/ligolo-ng/cmd/proxy@latest"
+    install_ligolo_tool "Installing ligolo-ng agent" agent "github.com/nicocha30/ligolo-ng/cmd/agent@latest"
     install_cargo_tool "Installing rustcat" rustcat rustcat
     
     log_success "Network tools installed"
@@ -1062,9 +1098,20 @@ create_documentation() {
 
 ### Repository Clones
 - **~/tools/web/**: XSStrike, Corsy
-- **~/tools/ad/**: BloodHound
+- **~/tools/ad/**: BloodHound (BloodHound CE - runs via docker compose)
 - **~/tools/privesc/**: PEASS-ng, linux-exploit-suggester
 - **~/tools/exploit/**: Sliver fallback clone if official installer failed
+
+### Python Repo Tools Without Auto-Installed Dependencies
+XSStrike and Corsy are cloned from GitHub. The script tries an isolated `pipx install`;
+if that is not possible for a given repo, dependencies are NOT installed system-wide.
+To run such a tool, create a per-tool virtual environment yourself, e.g.:
+```
+cd ~/tools/web/XSStrike
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python xsstrike.py
+```
 
 ## Update Commands
 - `update-tools` - Update all pentesting tools
@@ -1078,12 +1125,19 @@ create_documentation() {
 - **subfinder**: `~/.config/subfinder/provider-config.yaml`
 - **amass**: `~/.config/amass/config.ini`
 
-## BloodHound Setup
-1. Start Neo4j: `sudo systemctl start neo4j`
-2. Access Neo4j: `http://localhost:7474`
-3. Default credentials: `neo4j/neo4j`; change on first login.
-4. Launch or build BloodHound according to the repository instructions in `~/tools/ad/BloodHound`.
-5. Collect data with RustHound: `rusthound [options]`.
+## BloodHound Setup (BloodHound CE)
+BloodHound Community Edition runs as a set of containers (it is no longer an
+`npm run build` Electron/JS app). The clone in `~/tools/ad/BloodHound` ships a
+docker-compose setup.
+1. Start it: `cd ~/tools/ad/BloodHound && docker compose -f examples/docker-compose/docker-compose.yml up -d`
+   (path may vary by release; check the repo's `examples/docker-compose/` directory).
+2. Watch the container logs for the one-time randomly generated admin password:
+   `docker compose logs bloodhound | grep -i "Initial Password"`.
+3. Open the web UI: `http://localhost:8080` and log in as `admin` with that password.
+4. Collect data with RustHound (`rusthound [options]`) or SharpHound, then upload the
+   resulting zip in the BloodHound UI.
+Note: the bundled Neo4j service (`systemctl start neo4j`, `http://localhost:7474`) is only
+needed for the legacy BloodHound; BloodHound CE brings its own database container.
 
 ## Soft-Fail Behavior
 This setup script continues after individual failures. Review the terminal summary and `~/kali-setup.log` after each run. Re-running the script is safe for most steps: existing repositories are updated, existing tools are skipped, and failed package-manager states are repaired before retry.
@@ -1223,14 +1277,15 @@ display_summary() {
     echo "   - subfinder: ~/.config/subfinder/provider-config.yaml"
     echo "   - amass: ~/.config/amass/config.ini"
     echo ""
-    echo -e "${YELLOW}3. Setup Neo4j for BloodHound:${NC}"
-    echo "   - sudo systemctl start neo4j"
-    echo "   - Visit http://localhost:7474"
-    echo "   - Change default password neo4j/neo4j"
+    echo -e "${YELLOW}3. Start BloodHound CE (docker compose):${NC}"
+    echo "   - cd ~/tools/ad/BloodHound && docker compose -f examples/docker-compose/docker-compose.yml up -d"
+    echo "   - docker compose logs bloodhound | grep -i 'Initial Password'"
+    echo "   - Visit http://localhost:8080 and log in as admin with that password"
     echo ""
-    echo -e "${YELLOW}4. Build required tools when needed:${NC}"
-    echo "   - BloodHound: cd ~/tools/ad/BloodHound && npm install && npm run build"
+    echo -e "${YELLOW}4. Build / prepare tools when needed:${NC}"
     echo "   - Sliver fallback: cd ~/tools/exploit/sliver && make"
+    echo "   - XSStrike / Corsy (if deps not auto-installed): create a venv in the tool dir,"
+    echo "     e.g. cd ~/tools/web/XSStrike && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
     echo ""
     echo -e "${YELLOW}5. Smoke test after a new login shell:${NC}"
     echo "   - httpx -version"
