@@ -1,820 +1,317 @@
-# 🛡️ Kali Linux Complete Setup Script
+# 🛡️ Kali Linux Setup Script
+
+Automated, **soft-fail / self-healing** setup for a Kali (Debian-based) penetration-testing
+environment. One run installs ~45 offensive-security tools, a modern zsh shell, and an
+organized workspace — without aborting the whole install when a single tool fails.
+
+- **Author:** Barış PEKALP
+- **Version:** 3.0 (soft-fail / self-healing refactor)
+- **Repo:** https://github.com/PekSec/Kali-Setup
+
+---
 
 ## 📋 Table of Contents
 
-- [Overview](#-overview)
-- [Recent Improvements](#-recent-improvements-v20)
-- [Features](#-features)
+- [Design Philosophy](#-design-philosophy)
 - [Prerequisites](#-prerequisites)
 - [Quick Start](#-quick-start)
-- [Installed Tools](#-installed-tools)
-- [Directory Structure](#-directory-structure)
+- [Configuration Flags](#-configuration-flags)
+- [What Gets Installed](#-what-gets-installed)
+- [Shell Environment (zsh)](#-shell-environment-zsh)
+- [Directory Layout](#-directory-layout)
 - [Post-Installation](#-post-installation)
-- [Fish Shell Features](#-fish-shell-features)
-- [Usage Examples](#-usage-examples)
-- [Updating Tools](#-updating-tools)
+- [Updating](#-updating)
 - [Troubleshooting](#-troubleshooting)
 
 ---
 
-## 🎯 Overview
+## 🎯 Design Philosophy
 
-This comprehensive automated setup script transforms a fresh Kali Linux installation into a fully-configured penetration testing powerhouse. Designed for security professionals, bug bounty hunters, and red team operators, it eliminates hours of manual configuration and ensures consistent, reproducible environments.
+This script is deliberately **soft-fail**: there is no `set -e`. Every individual tool or
+package install is wrapped so a failure is logged and recorded, then the run continues. At the
+end you get a structured summary of soft errors and warnings instead of a half-finished system.
 
-### Why This Script?
+Key properties:
 
-- ⏰ **Save 4-6 hours** of manual installation time
-- 🎯 **41 essential tools** carefully selected and organized
-- 🐚 **Modern shell experience** with Fish + Starship
-- 📊 **Organized workflow** with categorized tool directories
-- 🔄 **Easy updates** with built-in update functions
-- 📝 **Comprehensive logging** for troubleshooting
-- ✅ **Production-tested** with robust error handling
-- 🛠️ **Build dependencies** automatically installed (Node.js, build-essential)
-
----
-
-## 🆕 Recent Improvements (v2.0)
-
-### Critical Fixes
-- ✅ **Removed `set -e`** - Script now continues through errors with proper logging
-- ✅ **Fixed Rust environment** - Cargo tools install reliably with verification
-- ✅ **Robust Fish config** - Shell works even if optional tools fail to install
-- ✅ **Fixed XSStrike/Corsy** - Python dependencies automatically installed
-- ✅ **Added `--depth 1`** - Git clones 5x faster with reduced disk usage
-
-### New Features
-- 🆕 **Node.js & build-essential** - Automatically installed for BloodHound compilation
-- 🆕 **Neo4j auto-start** - Service enabled and started automatically
-- 🆕 **Enhanced verification** - Detailed error reporting for failed installations
-- 🆕 **Tool location docs** - Clear documentation of where each tool is installed
-- 🆕 **Conditional checks** - Fish shell aliases fallback gracefully
-
-### Technical Improvements
-- 📈 **Accurate progress** - 85 actual steps (was 200)
-- 🔍 **Better verification** - Uses `log_error` instead of hiding failures
-- 🛡️ **Command verification** - New `check_command()` helper function
-- 📝 **Updated docs** - All tool locations and build instructions corrected
-
----
-
-## ✨ Features
-
-### 🔧 Core Components
-
-<table>
-<tr>
-<td width="50%">
-
-**Development Environment**
-- ✅ Go 1.21+ (latest)
-- ✅ Rust toolchain (via rustup)
-- ✅ Python 3.11+ with pipx
-- ✅ Docker CE with compose plugin
-- ✅ OpenJDK 21 LTS
-- ✅ Node.js 20.x LTS
-- ✅ build-essential & make
-
-</td>
-<td width="50%">
-
-**Shell Environment**
-- ✅ Fish shell with custom config
-- ✅ Starship prompt (nerd-font preset)
-- ✅ Eza (modern ls replacement)
-- ✅ Modern CLI tools (bat, fd, ripgrep)
-- ✅ Custom functions & abbreviations
-
-</td>
-</tr>
-</table>
-
-### 🛠️ Tool Categories
-
-| Category | Tools | Description |
-|----------|-------|-------------|
-| 🌐 **Web** | 10 tools | Web application security testing |
-| 🔍 **Recon** | 7 tools | Reconnaissance and enumeration |
-| 🕸️ **Network** | 4 tools | Network analysis and pivoting |
-| 🔓 **Exploit** | 3 tools | Exploitation frameworks and C2 |
-| 🩸 **AD** | 5 tools | Active Directory assessment |
-| 🔐 **PrivEsc** | 2 tools | Privilege escalation |
-| 🤖 **Automation** | 1 tool | Automated reconnaissance |
-| 🔍 **OSINT** | 3 tools | Information gathering |
-| ☁️ **Cloud** | 5 tools | Cloud security testing |
-| 🔧 **Misc** | 4 tools | Various utilities |
-
-### 🎨 Script Features
-
-- 🎨 **Colorful output** with progress indicators
-- 📊 **Real-time progress** (1/85, 2/85...)
-- 📝 **Detailed logging** to `~/kali-setup.log`
-- ⚠️ **Robust error handling** (logs all errors, continues installation)
-- 🔐 **Optional certificate installation**
-- ⏱️ **Performance metrics** (installation time tracking)
-- 📈 **Comprehensive verification** with detailed error reporting
-- 🔄 **Idempotent design** (safe to re-run)
-- 🛡️ **Conditional tool checks** (Fish shell works even if tools fail)
+- **No fail-fast** — one broken tool never blocks the other 40+.
+- **Self-healing** — transient failures are retried; apt/dpkg lock waits, `dpkg --configure -a`,
+  Go/Rust/pipx environment repairs, and `systemctl daemon-reload` are attempted automatically.
+- **Idempotent** — safe to re-run. Installed tools are skipped, existing repos are `git pull`ed,
+  and an existing `.zshrc` is backed up before replacement.
+- **No system-package breakage** — Python tooling uses `pipx` (isolated venvs) or user-managed
+  venvs. The script never runs `pip install --break-system-packages`.
+- **Structured logging** — everything is timestamped to `~/kali-setup.log`, and a colored
+  summary prints at the end.
 
 ---
 
 ## 🔧 Prerequisites
 
-### System Requirements
-
-- **OS:** Kali Linux 2024.1 or newer
-- **RAM:** 4GB minimum (8GB recommended)
-- **Disk Space:** 20GB free space
-- **Internet:** Stable internet connection
-- **Privileges:** Root or sudo access
-
-### Recommended
-
-- Fresh Kali Linux installation
-- Updated system packages
-- Backup of important data
+| Requirement | Detail |
+|-------------|--------|
+| **OS** | Kali Linux / Debian-based (Docker repo defaults to the `trixie` suite, falls back to `bookworm`) |
+| **Privileges** | Root or `sudo` (the script re-execs itself via `sudo -E` if not run as root) |
+| **Disk** | ~20 GB free (SecLists + PayloadsAllTheThings dominate) |
+| **Network** | Stable connection (many tools build from source / clone from GitHub) |
 
 ---
 
 ## 🚀 Quick Start
 
-### One-Line Installation
-
 ```bash
-# Download and run the script
-curl -fsSL https://raw.githubusercontent.com/peksec/kali-setup/main/kali-setup.sh | sudo bash
-```
-
-### Manual Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/peksec/kali-setup.git
-cd kali-setup
-
-# Make script executable
+git clone https://github.com/PekSec/Kali-Setup.git
+cd Kali-Setup
 chmod +x kali-setup.sh
-
-# Run the script
 sudo ./kali-setup.sh
 ```
 
-### With Custom Certificate
+### With a custom CA certificate
+
+Pass a `.crt` as the first argument; it is installed into the system trust store:
 
 ```bash
-# Run with your organization's certificate
-sudo ./kali-setup.sh /path/to/your/certificate.crt
+sudo ./kali-setup.sh /path/to/your-ca.crt
 ```
 
-### Installation Time
+> The `.zshrc` in this repo is copied to both the invoking user's home and `/root`. Keep the
+> script and `.zshrc` together in the same directory when running.
 
-```
-⏱️ Estimated time: 70-100 minutes
-📊 Total steps: 97
-🔧 Tools installed: 47
-📚 Wordlist repos: 4
-🛠️ Build dependencies: Node.js, build-essential, make
+---
+
+## ⚙️ Configuration Flags
+
+All are environment variables — set them before the command:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `DRY_RUN` | `0` | Print every action without executing it. |
+| `FORCE_REINSTALL` | `0` | Reinstall tools even if already present. |
+| `PENTEST_YEAR` | current year | Year used for the `~/pentests/<year>.NN` monthly folders. |
+| `DOCKER_DEBIAN_SUITE` | `trixie` | Debian suite for the Docker apt repo (auto-falls back to `bookworm`). |
+| `APT_INSTALL_RECOMMENDS` | `1` | Set to `0` to add `--no-install-recommends`. |
+| `LOG_FILE` | `~/kali-setup.log` | Log destination. |
+
+Example — preview everything first:
+
+```bash
+sudo DRY_RUN=1 ./kali-setup.sh
 ```
 
 ---
 
-## 🛠️ Installed Tools
+## 🛠️ What Gets Installed
 
-### 🌐 Web Application Security (10 tools)
+### Base system & toolchains
+Git, curl, wget, vim, jq, fzf, unzip, p7zip · modern CLI (bat, fd-find, ripgrep, tmux, btop) ·
+build-essential · OpenJDK (21, falls back to 17) · Node.js 20 · **Go** (`golang-go`) ·
+**Rust** (rustup) · **Python** (python3-full, pipx) · **Docker CE** + compose plugin ·
+**eza** (apt, cargo fallback).
 
-<details>
-<summary>Click to expand</summary>
+### Security tooling by category
 
-| Tool | Type | Description |
-|------|------|-------------|
-| **ffuf** | Go | Fast web fuzzer |
-| **httpx** | Go | HTTP probing toolkit |
-| **katana** | Go | Web crawling framework |
-| **nuclei** | Go | Vulnerability scanner |
-| **dalfox** | Go | XSS scanner |
-| **feroxbuster** | Rust | Directory bruteforcer |
-| **XSStrike** | Python | Advanced XSS detection |
-| **Arjun** | Python | HTTP parameter discovery |
-| **Corsy** | Python | CORS misconfiguration scanner |
-| **sqlmap** | Python | SQL injection tool |
+| Category | Tools |
+|----------|-------|
+| 🌐 **Web** | ffuf, httpx, katana, nuclei, dalfox *(Go)* · feroxbuster *(Rust)* · XSStrike, Corsy *(git clone)* · Arjun *(pipx)* · sqlmap *(apt)* |
+| 🔍 **Recon** | subfinder, assetfinder, amass, puredns, dnsx, naabu *(Go)* · rustscan *(Rust)* |
+| 🕸️ **Network** | chisel, ligolo-ng (proxy + agent) *(Go)* · rustcat *(Rust)* |
+| 🔓 **Exploit / C2** | Sliver *(official installer, git-clone fallback)* · impacket *(pipx)* · metasploit-framework *(apt)* |
+| 🩸 **Active Directory** | Neo4j *(apt)* · BloodHound CE *(git clone → docker compose)* · RustHound *(Rust)* · Certipy, Coercer *(pipx)* |
+| 🔐 **PrivEsc** | PEASS-ng (linpeas), linux-exploit-suggester *(git clone)* |
+| 🤖 **Automation** | AutoRecon *(pipx)* |
+| 🔍 **OSINT** | sherlock, holehe, h8mail *(pipx)* |
+| ☁️ **Cloud / Container** | trivy *(apt / official script)* · kube-hunter, ScoutSuite, Prowler *(pipx)* · CloudFox *(Go)* |
+| 🔧 **Misc** | Ciphey, haiti *(pipx)* · gitleaks *(Go)* · trufflehog *(pipx, Go fallback)* |
 
-</details>
+### Wordlists (git clones into `~/wordlists/`)
+fuzzdb · SecLists · PayloadsAllTheThings · Default-Accounts-Arsenal
 
-### 🔍 Reconnaissance & Enumeration (7 tools)
-
-<details>
-<summary>Click to expand</summary>
-
-| Tool | Type | Description |
-|------|------|-------------|
-| **subfinder** | Go | Subdomain discovery |
-| **assetfinder** | Go | Domain finder |
-| **amass** | Go | DNS enumeration |
-| **puredns** | Go | DNS bruteforcing |
-| **dnsx** | Go | DNS toolkit |
-| **naabu** | Go | Port scanner |
-| **rustscan** | Rust | Ultra-fast port scanner |
-
-</details>
-
-### 🕸️ Network Analysis & Pivoting (4 tools)
-
-<details>
-<summary>Click to expand</summary>
-
-| Tool | Type | Description |
-|------|------|-------------|
-| **chisel** | Go | HTTP tunneling |
-| **ligolo-ng** | Go | Advanced tunneling (proxy + agent) |
-| **rustcat** | Rust | Netcat alternative |
-
-</details>
-
-### 🔓 Exploitation & C2 (3 tools)
-
-<details>
-<summary>Click to expand</summary>
-
-| Tool | Type | Description |
-|------|------|-------------|
-| **sliver** | Go | Modern C2 framework |
-| **impacket** | Python | SMB/MSRPC toolkit |
-| **metasploit-framework** | Ruby | Comprehensive exploitation framework |
-
-</details>
-
-### 🩸 Active Directory (5 tools)
-
-<details>
-<summary>Click to expand</summary>
-
-| Tool | Type | Description |
-|------|------|-------------|
-| **Neo4j** | Database | Graph database for BloodHound |
-| **BloodHound** | JavaScript | AD analysis GUI |
-| **RustHound** | Rust | BloodHound data collector |
-| **Certipy** | Python | AD certificate abuse |
-| **Coercer** | Python | Force Windows authentication |
-
-</details>
-
-### 🔐 Privilege Escalation (2 tools)
-
-<details>
-<summary>Click to expand</summary>
-
-| Tool | Type | Description |
-|------|------|-------------|
-| **PEASS-ng** | Bash/C# | Privilege escalation suite |
-| **linux-exploit-suggester** | Bash | Kernel exploit suggester |
-
-</details>
-
-### 🤖 Automation Frameworks (1 tool)
-
-<details>
-<summary>Click to expand</summary>
-
-| Tool | Type | Description |
-|------|------|-------------|
-| **AutoRecon** | Python | Multi-threaded reconnaissance |
-
-</details>
-
-### 🔍 OSINT (3 tools)
-
-<details>
-<summary>Click to expand</summary>
-
-| Tool | Type | Description |
-|------|------|-------------|
-| **sherlock** | Python | Social media username search |
-| **holehe** | Python | Email OSINT |
-| **h8mail** | Python | Email breach hunting |
-
-</details>
-
-### ☁️ Cloud & Container Security (5 tools)
-
-<details>
-<summary>Click to expand</summary>
-
-| Tool | Type | Description |
-|------|------|-------------|
-| **trivy** | Go | Container vulnerability scanner |
-| **kube-hunter** | Python | Kubernetes pentesting |
-| **cloudfox** | Go | AWS/Azure/GCP enumeration |
-| **scoutsuite** | Python | Multi-cloud security auditing |
-| **prowler** | Python | AWS security assessment |
-
-</details>
-
-### 🔧 Miscellaneous (4 tools)
-
-<details>
-<summary>Click to expand</summary>
-
-| Tool | Type | Description |
-|------|------|-------------|
-| **Ciphey** | Python | Automated decryption |
-| **haiti** | Ruby | Hash identifier |
-| **gitleaks** | Go | Git secret scanner |
-| **trufflehog** | Python | Credential scanner |
-
-</details>
-
-### 📚 Wordlist Repositories (4 repos)
-
-- **fuzzdb** - Comprehensive fuzzing patterns
-- **SecLists** - Industry-standard wordlists (cloned from GitHub with depth 1)
-- **PayloadsAllTheThings** - Practical payload collection
-- **Default-Accounts-Arsenal** - Default credentials database
+> **Python repo tools (XSStrike, Corsy):** always cloned. The script attempts an isolated
+> `pipx install` of the repo; if the repo isn't packaged for pipx, dependencies are **not**
+> installed system-wide. Create a per-tool venv yourself — see [Post-Installation](#-post-installation).
 
 ---
 
-## 📁 Directory Structure
+## 🐚 Shell Environment (zsh)
+
+The `.zshrc` in this repo is installed for both the user and root.
+
+- **Framework:** Oh My Zsh + **Powerlevel10k** theme
+- **Plugins** (loaded only if present): `git`, `sudo`, `fzf`, `docker`, `kubectl`,
+  `zsh-autosuggestions`, `zsh-history-substring-search`, `zsh-syntax-highlighting`
+- **Colors:** Dracula palette for syntax highlighting
+- **PATH:** auto-adds `~/.local/bin`, `~/bin`, `~/go/bin`, `~/.cargo/bin`, `/usr/local/go/bin`
+  (de-duplicated, only existing dirs)
+- **Shared root access:** the setup writes `/root/.zshrc.local`, which `.zshrc` sources, so the
+  **root** shell also gets the primary user's `~/go/bin`, `~/.cargo/bin`, and `~/.local/bin` on
+  its PATH — root can run tools installed under the user without reinstalling them. Any host can
+  drop its own `~/.zshrc.local` for machine-local PATH tweaks.
+- **History:** 50k lines, shared across sessions, dedup + ignore-space
+
+### Functions
+
+| Function | Purpose |
+|----------|---------|
+| `update-system` | apt update / upgrade / autoremove / autoclean |
+| `update-tools` | Reinstall/upgrade all Go, Rust, pipx tools + nuclei templates |
+| `update-wordlists` | `git pull` every wordlist repo |
+| `venv` | Activate `./venv` or `./.venv` in the current directory |
+| `zsh-healthcheck` | Print shell info, PATH, and tool-availability report |
+| `toolsweb`, `toolsrecon`, `toolsnetwork`, `toolsexploit`, `toolsad`, `toolsprivesc`, `toolsauto`, `toolsosint`, `toolscloud`, `toolsmisc` | `cd` into the matching `~/tools/<category>` |
+
+### Aliases (selected)
+
+```
+ls / ll / la / tree     eza with icons (falls back to coreutils ls)
+.. ... ....             cd up 1 / 2 / 3 levels
+gst gco gp gps ga gc    git status/checkout/pull/push/add/commit (+ more)
+dps dpsa di dex dlog    docker ps / images / exec -it / logs (+ compose: dc, dcu, dcud, dcd)
+k kgp kgs kgd kl        kubectl get pods/svc/deploy, logs (+ more)
+reload-zsh              source ~/.zshrc
+```
+
+---
+
+## 📁 Directory Layout
 
 ```
 ~/
-├── .cargo/bin/                   # Rust tools (in PATH)
-│   ├── feroxbuster
-│   ├── rustscan
-│   ├── rustcat
-│   ├── rusthound
-│   └── eza
-│
-├── .local/bin/                   # Pipx tools (in PATH)
-│   ├── impacket-*
-│   ├── certipy
-│   ├── autorecon
-│   ├── sherlock
-│   └── ...
-│
-├── go/bin/                       # Go tools (in PATH)
-│   ├── ffuf
-│   ├── httpx
-│   ├── nuclei
-│   ├── subfinder
-│   └── ...
-│
-├── wordlists/                    # Wordlist repositories
-│   ├── fuzzdb/
-│   ├── SecLists/
-│   ├── PayloadsAllTheThings/
-│   └── Default-Accounts-Arsenal/
-│
-├── pentests/                     # Project organization
-│   ├── 2026.01/
-│   ├── 2026.02/
-│   └── ... (all months)
-│
-└── tools/                        # Git-cloned tools
-    ├── web/                      # Web application security
-    │   ├── XSStrike/             # With Python dependencies
-    │   └── Corsy/                # With Python dependencies
-    ├── recon/                    # (empty - Go tools in ~/go/bin)
-    ├── network/                  # (empty - Go/Rust tools in PATH)
-    ├── exploit/                  # Exploitation
-    │   └── sliver/               # (if installer failed)
-    ├── ad/                       # Active Directory
-    │   └── BloodHound/           # Requires npm build
-    ├── privesc/                  # Privilege escalation
-    │   ├── PEASS-ng/
-    │   └── linux-exploit-suggester/
-    ├── automation/               # (empty - AutoRecon in ~/.local/bin)
-    ├── osint/                    # (empty - pipx tools in PATH)
-    ├── cloud/                    # (empty - trivy/kube-hunter in PATH)
-    └── misc/                     # (empty - Ciphey/haiti in PATH)
+├── go/bin/           Go tools (in PATH)
+├── .cargo/bin/       Rust tools (in PATH)
+├── .local/bin/       pipx tools (in PATH)
+├── wordlists/        fuzzdb, SecLists, PayloadsAllTheThings, Default-Accounts-Arsenal
+├── pentests/         Monthly project folders: <YEAR>.01 … <YEAR>.12
+└── tools/            Git-cloned tools + generated README.md
+    ├── web/          XSStrike, Corsy
+    ├── recon/        (Go tools live in ~/go/bin)
+    ├── network/      (Go/Rust tools live in PATH)
+    ├── exploit/      sliver/ (only if the official installer failed)
+    ├── ad/           BloodHound/ (BloodHound CE — docker compose)
+    ├── privesc/      PEASS-ng, linux-exploit-suggester
+    ├── automation/   (AutoRecon lives in ~/.local/bin)
+    ├── osint/        (pipx tools live in PATH)
+    ├── cloud/        (mixed PATH locations)
+    └── misc/         (mixed PATH locations)
 ```
 
-**Note:** Most tools are installed to standard binary locations and automatically added to PATH. The `~/tools/` directory primarily contains git-cloned repositories that need manual execution or building.
+Most binaries land in standard `bin` dirs already on `PATH`; `~/tools/` holds the repos that
+must be run in place.
 
 ---
 
 ## 🔄 Post-Installation
 
-### 1️⃣ Restart Your Session
+After the run, the summary lists manual steps. In short:
+
+**1. Start a new login shell** — needed for the zsh switch, the `docker` group, and PATH
+changes from Go/Rust/pipx. Log out and back in.
+
+**2. Configure API keys** (optional, for fuller results):
 
 ```bash
-# Log out and log back in for all changes to take effect
-logout
+$EDITOR ~/.config/subfinder/provider-config.yaml
+$EDITOR ~/.config/amass/config.ini
 ```
 
-This activates:
-- New shell (Fish)
-- Docker group membership
-- PATH changes
-- Environment variables
-
-### 2️⃣ Configure API Keys
-
-#### Subfinder
-
-```bash
-nano ~/.config/subfinder/provider-config.yaml
-```
-
-Example configuration:
-
-```yaml
-virustotal:
-  - YOUR_VT_API_KEY
-shodan:
-  - YOUR_SHODAN_API_KEY
-censys:
-  - YOUR_CENSYS_API_ID:YOUR_CENSYS_API_SECRET
-binaryedge:
-  - YOUR_BINARYEDGE_API_KEY
-bevigil:
-  - YOUR_BEVIGIL_API_KEY
-```
-
-[Get API Keys →](https://github.com/projectdiscovery/subfinder#post-installation-instructions)
-
-#### Amass
-
-```bash
-nano ~/.config/amass/config.ini
-```
-
-Example configuration:
-
-```ini
-[data_sources]
-[data_sources.AlienVault]
-[data_sources.AlienVault.Credentials]
-apikey = YOUR_ALIENVAULT_API_KEY
-
-[data_sources.BinaryEdge]
-[data_sources.BinaryEdge.Credentials]
-apikey = YOUR_BINARYEDGE_API_KEY
-
-[data_sources.Censys]
-[data_sources.Censys.Credentials]
-apikey = YOUR_CENSYS_API_ID
-secret = YOUR_CENSYS_API_SECRET
-```
-
-[Get API Keys →](https://github.com/owasp-amass/amass/blob/master/examples/config.ini)
-
-### 3️⃣ Setup Neo4j for BloodHound
-
-Neo4j service is automatically enabled and started during installation. You can verify:
-
-```bash
-# Check Neo4j status
-sudo systemctl status neo4j
-
-# Access Neo4j web interface
-firefox http://localhost:7474
-```
-
-**Default credentials:**
-- Username: `neo4j`
-- Password: `neo4j`
-
-⚠️ **Important:** Change password on first login!
-
-### 4️⃣ Build Required Tools
-
-#### BloodHound (Requires Node.js - already installed)
+**3. BloodHound CE** — it is now container-based (no `npm build`):
 
 ```bash
 cd ~/tools/ad/BloodHound
-npm install
-npm run build
+docker compose -f examples/docker-compose/docker-compose.yml up -d   # path may vary by release
+docker compose logs bloodhound | grep -i "Initial Password"          # one-time admin password
+# open http://localhost:8080 and log in as: admin
 ```
 
-#### Sliver C2 Framework (Only if official installer failed)
+Collect data with RustHound (`rusthound ...`) or SharpHound, then upload the zip in the UI.
+The bundled Neo4j service (`:7474`) is only for the legacy BloodHound.
 
-The script attempts to install Sliver via the official installer. Only build manually if that failed:
+**4. XSStrike / Corsy** — if dependencies were not auto-installed, make a venv yourself:
 
 ```bash
-cd ~/tools/exploit/sliver
-make
+cd ~/tools/web/XSStrike
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python xsstrike.py
 ```
 
-**Note:** XSStrike and Corsy Python dependencies are automatically installed during setup.
+**5. Sliver** — if the official installer failed, the repo was cloned; build with `make` in
+`~/tools/exploit/sliver`.
 
-### 5️⃣ Verify Installation
+**6. Smoke test:**
 
 ```bash
-# Test Go tools
 httpx -version
 nuclei -version
-subfinder -version
-
-# Test Rust tools
-feroxbuster --version
-rustscan --version
-
-# Test Python tools
-impacket-smbclient --help
-certipy --help
-
-# Test navigation
-toolsweb    # Should navigate to ~/tools/web
+toolsweb          # should cd into ~/tools/web
+zsh-healthcheck   # tool-availability overview
 ```
 
 ---
 
-## 🐚 Fish Shell Features
+## 🔃 Updating
 
-### 🎨 Custom Functions
-
-#### System Management
-
-```fish
-update-system          # Update system packages
-update-wordlists       # Update wordlist repositories
-update-tools           # Update all pentesting tools
-venv                   # Activate Python virtual environment
-```
-
-#### Quick Navigation
-
-```fish
-toolsweb              # cd ~/tools/web
-toolsrecon            # cd ~/tools/recon
-toolsnetwork          # cd ~/tools/network
-toolsexploit          # cd ~/tools/exploit
-toolsad               # cd ~/tools/ad
-toolsprivesc          # cd ~/tools/privesc
-toolsauto             # cd ~/tools/automation
-toolsosint            # cd ~/tools/osint
-toolscloud            # cd ~/tools/cloud
-toolsmisc             # cd ~/tools/misc
-```
-
-### ⚡ Abbreviations
-
-The script installs powerful abbreviations that expand as you type:
-
-#### File Operations
-
-```fish
-ll        # eza -la --icons --group-directories-first
-la        # eza -a --icons --group-directories-first
-..        # cd ..
-...       # cd ../..
-....      # cd ../../..
-```
-
-#### Git Shortcuts
-
-```fish
-gst       # git status
-gco       # git checkout
-gp        # git pull
-gps       # git push
-ga        # git add
-gc        # git commit
-gd        # git diff
-gl        # git log --oneline --graph
-```
-
-#### Docker Shortcuts
-
-```fish
-dps       # docker ps
-dpsa      # docker ps -a
-di        # docker images
-dex       # docker exec -it
-dlog      # docker logs -f
-```
-
----
-
-## 💡 Usage Examples
-
-### Web Application Testing
+The installed `.zshrc` provides update helpers:
 
 ```bash
-# Subdomain enumeration
-subfinder -d target.com | httpx -mc 200
-
-# Directory fuzzing
-ffuf -u https://target.com/FUZZ -w ~/wordlists/SecLists/Discovery/Web-Content/raft-large-directories.txt
-
-# Vulnerability scanning
-nuclei -u https://target.com -t ~/nuclei-templates/
+update-system      # apt update + upgrade + autoremove + autoclean
+update-tools       # reinstall/upgrade all Go + Rust + pipx tools, refresh nuclei templates
+update-wordlists   # git pull every wordlist repo
 ```
 
-### Reconnaissance
-
-```bash
-# Fast port scan
-rustscan -a target.com -- -sV -sC
-
-# DNS enumeration
-dnsx -l subdomains.txt -resp
-
-# Active subdomain verification
-cat subdomains.txt | httpx -title -tech-detect -status-code
-```
-
-### Active Directory
-
-```bash
-# Collect BloodHound data
-rusthound -d domain.local -u user -p password -o bloodhound
-
-# Certificate abuse
-certipy find -u user@domain.local -p password -dc-ip 10.10.10.10
-
-# SMB enumeration
-impacket-smbclient domain/user:password@target
-```
-
-### Automation
-
-```bash
-# Automated reconnaissance with AutoRecon
-autorecon target.com
-
-# AutoRecon with custom options
-autorecon --output /path/to/output target.com
-
-# AutoRecon with specific plugins
-autorecon --only-scans-dir target.com
-```
-
----
-
-## 🔄 Updating Tools
-
-### Quick Update
-
-```fish
-# Update everything
-update-system && update-tools && update-wordlists
-```
-
-### Individual Updates
-
-```fish
-# Update system packages
-update-system
-
-# Update pentesting tools
-update-tools
-
-# Update wordlists
-update-wordlists
-```
-
-### Manual Updates
-
-```bash
-# Update specific Go tool
-go install github.com/ffuf/ffuf/v2@latest
-
-# Update specific Rust tool
-cargo install feroxbuster
-
-# Update all pipx tools
-pipx upgrade-all
-
-# Update git repositories
-cd ~/tools/web/sqlmap && git pull
-```
+Or re-run the setup script — it is idempotent and will pull repos / skip satisfied tools.
+Use `FORCE_REINSTALL=1` to rebuild everything.
 
 ---
 
 ## 🐛 Troubleshooting
 
-### Common Issues
+**Read the log first** — every action is timestamped there:
 
-<details>
-<summary><b>"Command not found" after installation</b></summary>
-
-**Solution:**
 ```bash
-# Restart your session
-logout
-
-# Or reload PATH
-source ~/.cargo/env
+grep -E 'ERROR|WARNING' ~/kali-setup.log
+tail -n 50 ~/kali-setup.log
 ```
 
+The end-of-run summary also lists soft errors and warnings with their return codes and the exact
+command that failed, so you can re-run just that piece.
+
+<details>
+<summary><b>"command not found" right after install</b></summary>
+
+You haven't started a new login shell yet. `source ~/.zshrc`, or log out and back in — Go/Rust/pipx
+bin dirs are only added to PATH by the new `.zshrc`.
 </details>
 
 <details>
-<summary><b>Docker permission denied</b></summary>
+<summary><b>Docker: permission denied</b></summary>
 
-**Solution:**
-```bash
-# Restart session to activate docker group
-logout
-
-# Or use newgrp
-newgrp docker
-```
-
+Your session predates the `docker` group membership. Run `newgrp docker` or re-login.
 </details>
 
 <details>
-<summary><b>Go tools not found</b></summary>
+<summary><b>Python tool won't run (missing modules)</b></summary>
 
-**Solution:**
-```bash
-# Check GOPATH
-echo $GOPATH  # Should be ~/go
-
-# Add to PATH manually
-set -gx PATH $PATH $HOME/go/bin
-```
-
+For XSStrike/Corsy the deps may not have auto-installed (by design — no system-package breakage).
+Create a venv in the tool's folder and `pip install -r requirements.txt` there. See step 4 above.
 </details>
 
 <details>
-<summary><b>Nuclei templates update fails</b></summary>
+<summary><b>A tool failed but the script "finished"</b></summary>
 
-**Solution:**
-```bash
-# Manual update
-nuclei -update-templates
-
-# Or reinstall
-go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-nuclei -update-templates
-```
-
+That's the soft-fail design. Check the summary's "Soft errors" section and the log, fix the
+blocker (often a transient network issue), and re-run — completed tools are skipped.
 </details>
 
 <details>
-<summary><b>Fish shell not default after installation</b></summary>
+<summary><b>Neo4j not active (verification warning)</b></summary>
 
-**Solution:**
 ```bash
-# Change shell manually
-chsh -s /usr/bin/fish
-
-# Verify
-echo $SHELL  # Should be /usr/bin/fish
-```
-
-</details>
-
-<details>
-<summary><b>Verification reports tool not found</b></summary>
-
-**Solution:**
-```bash
-# The script now reports accurate verification failures
-# Check the error count and log for details
-
-# Manually test the tool
-command -v toolname
-
-# If Go tool is missing
-go install github.com/tool/path@latest
-
-# If Rust tool is missing
-cargo install toolname
-
-# If Pipx tool is missing
-pipx install toolname
-```
-
-**Note:** The script continues even if some tools fail. Check `ERROR_COUNT` at the end and review `~/kali-setup.log` for specific failures.
-
-</details>
-
-<details>
-<summary><b>Neo4j not starting</b></summary>
-
-**Solution:**
-```bash
-# Check Neo4j status
 sudo systemctl status neo4j
-
-# Start manually
-sudo systemctl start neo4j
-
-# Enable for boot
-sudo systemctl enable neo4j
-
-# Check logs
+sudo systemctl restart neo4j
 sudo journalctl -u neo4j -n 50
 ```
-
+Note: BloodHound CE brings its own database container and does not need this Neo4j service.
 </details>
 
-### Log Analysis
+---
 
-Check the installation log for detailed error messages:
-
-```bash
-# View entire log
-cat ~/kali-setup.log
-
-# Find errors
-grep ERROR ~/kali-setup.log
-
-# Find warnings
-grep WARNING ~/kali-setup.log
-
-# Last 50 lines
-tail -50 ~/kali-setup.log
-```
+*Generated tool docs are also written to `~/tools/README.md` on each run.*

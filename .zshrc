@@ -115,6 +115,16 @@ _path_append "$HOME/.cargo/bin"
 export PATH
 
 # -------------------------------------------------------------------
+# Machine-local PATH additions
+# Sourced if present, before tool-dependent aliases are set up.
+# kali-setup writes /root/.zshrc.local here so the root user can run
+# Go/Rust/pipx tools that were installed under the primary user's home.
+# -------------------------------------------------------------------
+if [[ -r "$HOME/.zshrc.local" ]]; then
+    source "$HOME/.zshrc.local"
+fi
+
+# -------------------------------------------------------------------
 # Plugin loader
 # Only loads plugins that actually exist.
 # Prevents startup warnings from missing custom plugins.
@@ -240,7 +250,6 @@ fi
 
 # -------------------------------------------------------------------
 # Navigation aliases
-# Fish abbr equivalents
 # -------------------------------------------------------------------
 alias ..='cd ..'
 alias ...='cd ../..'

@@ -795,6 +795,41 @@ install_zshrc_file() {
     fi
 }
 
+install_root_user_tool_paths() {
+    local home_dir="$ACTUAL_HOME"
+    local local_file="/root/.zshrc.local"
+
+    progress "Granting root access to user-installed tools"
+
+    if [[ "$ACTUAL_USER" == "root" || "$home_dir" == "/root" || -z "$home_dir" ]]; then
+        log_info "Actual user is root; no separate user bins to expose"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log_info "DRY_RUN: would write $local_file exposing $home_dir bins to root"
+        return 0
+    fi
+
+    # Sourced by /root/.zshrc via the .zshrc.local hook. _path_append comes from
+    # .zshrc and only adds directories that actually exist.
+    if cat > "$local_file" <<EOFROOTPATHS
+# Managed by kali-setup.sh - do not edit by hand.
+# Adds ${ACTUAL_USER}'s tool directories to root's PATH so root can run the
+# Go/Rust/pipx tools installed during setup.
+_path_append "$home_dir/.local/bin"
+_path_append "$home_dir/go/bin"
+_path_append "$home_dir/.cargo/bin"
+EOFROOTPATHS
+    then
+        chown root:root "$local_file" 2>/dev/null || true
+        chmod 0644 "$local_file" 2>/dev/null || true
+        log_success "root can now use ${ACTUAL_USER}'s installed tools (via $local_file)"
+    else
+        record_issue "warning" "Writing root tool-path file" 1 "$local_file"
+    fi
+}
+
 configure_shell() {
     section_header "Shell Configuration"
     
@@ -815,7 +850,8 @@ configure_shell() {
     install_zsh_stack_for_root
     install_zshrc_file "Installing .zshrc for user" "$ACTUAL_HOME" "$ACTUAL_USER" "$actual_group"
     install_zshrc_file "Installing .zshrc for root" "/root" "root" "root"
-    
+    install_root_user_tool_paths
+
     log_success "Shell configuration completed"
 }
 
