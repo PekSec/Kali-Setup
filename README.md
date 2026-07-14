@@ -47,12 +47,12 @@ Key properties:
 
 ## 🔧 Prerequisites
 
-| Requirement | Detail |
-|-------------|--------|
-| **OS** | Kali Linux / Debian-based (Docker repo defaults to the `trixie` suite, falls back to `bookworm`) |
-| **Privileges** | Root or `sudo` (the script re-execs itself via `sudo -E` if not run as root) |
-| **Disk** | ~20 GB free (SecLists + PayloadsAllTheThings dominate) |
-| **Network** | Stable connection (many tools build from source / clone from GitHub) |
+| Requirement    | Detail                                                                                           |
+| -------------- | ------------------------------------------------------------------------------------------------ |
+| **OS**         | Kali Linux / Debian-based (Docker repo defaults to the `trixie` suite, falls back to `bookworm`) |
+| **Privileges** | Root or `sudo` (the script re-execs itself via `sudo -E` if not run as root)                     |
+| **Disk**       | ~20 GB free (SecLists + PayloadsAllTheThings dominate)                                           |
+| **Network**    | Stable connection (many tools build from source / clone from GitHub)                             |
 
 ---
 
@@ -82,14 +82,14 @@ sudo ./kali-setup.sh /path/to/your-ca.crt
 
 All are environment variables — set them before the command:
 
-| Variable | Default | Effect |
-|----------|---------|--------|
-| `DRY_RUN` | `0` | Print every action without executing it. |
-| `FORCE_REINSTALL` | `0` | Reinstall tools even if already present. |
-| `PENTEST_YEAR` | current year | Year used for the `~/pentests/<year>.NN` monthly folders. |
-| `DOCKER_DEBIAN_SUITE` | `trixie` | Debian suite for the Docker apt repo (auto-falls back to `bookworm`). |
-| `APT_INSTALL_RECOMMENDS` | `1` | Set to `0` to add `--no-install-recommends`. |
-| `LOG_FILE` | `~/kali-setup.log` | Log destination. |
+| Variable                 | Default            | Effect                                                                |
+| ------------------------ | ------------------ | --------------------------------------------------------------------- |
+| `DRY_RUN`                | `0`                | Print every action without executing it.                              |
+| `FORCE_REINSTALL`        | `0`                | Reinstall tools even if already present.                              |
+| `PENTEST_YEAR`           | current year       | Year used for the `~/pentests/<year>.NN` monthly folders.             |
+| `DOCKER_DEBIAN_SUITE`    | `trixie`           | Debian suite for the Docker apt repo (auto-falls back to `bookworm`). |
+| `APT_INSTALL_RECOMMENDS` | `1`                | Set to `0` to add `--no-install-recommends`.                          |
+| `LOG_FILE`               | `~/kali-setup.log` | Log destination.                                                      |
 
 Example — preview everything first:
 
@@ -102,6 +102,7 @@ sudo DRY_RUN=1 ./kali-setup.sh
 ## 🛠️ What Gets Installed
 
 ### Base system & toolchains
+
 Git, curl, wget, vim, jq, fzf, unzip, p7zip · modern CLI (bat, fd-find, ripgrep, tmux, btop) ·
 build-essential · OpenJDK (21, falls back to 17) · Node.js 20 · **Go** (`golang-go`) ·
 **Rust** (rustup) · **Python** (python3-full, pipx) · **Docker CE** + compose plugin ·
@@ -109,20 +110,21 @@ build-essential · OpenJDK (21, falls back to 17) · Node.js 20 · **Go** (`gola
 
 ### Security tooling by category
 
-| Category | Tools |
-|----------|-------|
-| 🌐 **Web** | ffuf, httpx, katana, nuclei, dalfox *(Go)* · feroxbuster *(Rust)* · XSStrike, Corsy *(git clone)* · Arjun *(pipx)* · sqlmap *(apt)* |
-| 🔍 **Recon** | subfinder, assetfinder, amass, puredns, dnsx, naabu *(Go)* · rustscan *(Rust)* |
-| 🕸️ **Network** | chisel, ligolo-ng (proxy + agent) *(Go)* · rustcat *(Rust)* |
-| 🔓 **Exploit / C2** | Sliver *(official installer, git-clone fallback)* · impacket *(pipx)* · metasploit-framework *(apt)* |
-| 🩸 **Active Directory** | Neo4j *(apt)* · BloodHound CE *(git clone → docker compose)* · RustHound *(Rust)* · Certipy, Coercer *(pipx)* |
-| 🔐 **PrivEsc** | PEASS-ng (linpeas), linux-exploit-suggester *(git clone)* |
-| 🤖 **Automation** | AutoRecon *(pipx)* |
-| 🔍 **OSINT** | sherlock, holehe, h8mail *(pipx)* |
-| ☁️ **Cloud / Container** | trivy *(apt / official script)* · kube-hunter, ScoutSuite, Prowler *(pipx)* · CloudFox *(Go)* |
-| 🔧 **Misc** | Ciphey, haiti *(pipx)* · gitleaks *(Go)* · trufflehog *(pipx, Go fallback)* |
+| Category                 | Tools                                                                                                                               |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| 🌐 **Web**               | ffuf, httpx, katana, nuclei, dalfox _(Go)_ · feroxbuster _(Rust)_ · XSStrike, Corsy _(git clone)_ · Arjun _(pipx)_ · sqlmap _(apt)_ |
+| 🔍 **Recon**             | subfinder, assetfinder, amass, puredns, dnsx, naabu _(Go)_ · rustscan _(Rust)_                                                      |
+| 🕸️ **Network**           | chisel, ligolo-ng (proxy + agent) _(Go)_ · rustcat _(Rust)_                                                                         |
+| 🔓 **Exploit / C2**      | Sliver _(official installer, git-clone fallback)_ · impacket _(pipx)_ · metasploit-framework _(apt)_                                |
+| 🩸 **Active Directory**  | Neo4j _(apt)_ · BloodHound CE _(git clone → docker compose)_ · RustHound _(Rust)_ · Certipy, Coercer _(pipx)_                       |
+| 🔐 **PrivEsc**           | PEASS-ng (linpeas), linux-exploit-suggester _(git clone)_                                                                           |
+| 🤖 **Automation**        | AutoRecon _(pipx)_                                                                                                                  |
+| 🔍 **OSINT**             | sherlock, holehe, h8mail _(pipx)_                                                                                                   |
+| ☁️ **Cloud / Container** | trivy _(apt / official script)_ · kube-hunter, ScoutSuite, Prowler _(pipx)_ · CloudFox _(Go)_                                       |
+| 🔧 **Misc**              | Ciphey, haiti _(pipx)_ · gitleaks _(Go)_ · trufflehog _(pipx, Go fallback)_                                                         |
 
 ### Wordlists (git clones into `~/wordlists/`)
+
 fuzzdb · SecLists · PayloadsAllTheThings · Default-Accounts-Arsenal
 
 > **Python repo tools (XSStrike, Corsy):** always cloned. The script attempts an isolated
@@ -149,14 +151,14 @@ The `.zshrc` in this repo is installed for both the user and root.
 
 ### Functions
 
-| Function | Purpose |
-|----------|---------|
-| `update-system` | apt update / upgrade / autoremove / autoclean |
-| `update-tools` | Reinstall/upgrade all Go, Rust, pipx tools + nuclei templates |
-| `update-wordlists` | `git pull` every wordlist repo |
-| `venv` | Activate `./venv` or `./.venv` in the current directory |
-| `zsh-healthcheck` | Print shell info, PATH, and tool-availability report |
-| `toolsweb`, `toolsrecon`, `toolsnetwork`, `toolsexploit`, `toolsad`, `toolsprivesc`, `toolsauto`, `toolsosint`, `toolscloud`, `toolsmisc` | `cd` into the matching `~/tools/<category>` |
+| Function                                                                                                                                  | Purpose                                                       |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `update-system`                                                                                                                           | apt update / upgrade / autoremove / autoclean                 |
+| `update-tools`                                                                                                                            | Reinstall/upgrade all Go, Rust, pipx tools + nuclei templates |
+| `update-wordlists`                                                                                                                        | `git pull` every wordlist repo                                |
+| `venv`                                                                                                                                    | Activate `./venv` or `./.venv` in the current directory       |
+| `zsh-healthcheck`                                                                                                                         | Print shell info, PATH, and tool-availability report          |
+| `toolsweb`, `toolsrecon`, `toolsnetwork`, `toolsexploit`, `toolsad`, `toolsprivesc`, `toolsauto`, `toolsosint`, `toolscloud`, `toolsmisc` | `cd` into the matching `~/tools/<category>`                   |
 
 ### Aliases (selected)
 
@@ -279,12 +281,14 @@ command that failed, so you can re-run just that piece.
 
 You haven't started a new login shell yet. `source ~/.zshrc`, or log out and back in — Go/Rust/pipx
 bin dirs are only added to PATH by the new `.zshrc`.
+
 </details>
 
 <details>
 <summary><b>Docker: permission denied</b></summary>
 
 Your session predates the `docker` group membership. Run `newgrp docker` or re-login.
+
 </details>
 
 <details>
@@ -292,6 +296,7 @@ Your session predates the `docker` group membership. Run `newgrp docker` or re-l
 
 For XSStrike/Corsy the deps may not have auto-installed (by design — no system-package breakage).
 Create a venv in the tool's folder and `pip install -r requirements.txt` there. See step 4 above.
+
 </details>
 
 <details>
@@ -299,6 +304,7 @@ Create a venv in the tool's folder and `pip install -r requirements.txt` there. 
 
 That's the soft-fail design. Check the summary's "Soft errors" section and the log, fix the
 blocker (often a transient network issue), and re-run — completed tools are skipped.
+
 </details>
 
 <details>
@@ -309,9 +315,11 @@ sudo systemctl status neo4j
 sudo systemctl restart neo4j
 sudo journalctl -u neo4j -n 50
 ```
+
 Note: BloodHound CE brings its own database container and does not need this Neo4j service.
+
 </details>
 
 ---
 
-*Generated tool docs are also written to `~/tools/README.md` on each run.*
+_Generated tool docs are also written to `~/tools/README.md` on each run._
